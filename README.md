@@ -70,6 +70,9 @@ Example against a local stagenet node:
 
 - The wallet file is encrypted at rest and written with `0600`
   permissions; daemon-reported fee rates are sanity-capped.
+- New seeds are 32 bytes (256 bits) of entropy from the OS CSPRNG
+  (`rand::thread_rng` → ChaCha12, seeded by `getrandom`) — the same class
+  of randomness used by other software wallets; as safe as your machine is.
 - That said, again, this is young, AI-written code: prefer running it against
   your **own** node, on **stagenet/testnet**, or with **small mainnet amounts**
   you can afford to lose.
