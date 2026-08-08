@@ -177,8 +177,7 @@ async fn main() -> Result<()> {
         }
         WalletFileFormat::Missing => {
             // No wallet — run the setup wizard
-            let wizard_result =
-                wizard::run_wizard(&config.wallet.path, config.wallet.network.into())?;
+            let wizard_result = wizard::run_wizard(&config.wallet.path, config.wallet.network)?;
 
             // A newly created wallet has no history: start scanning at the
             // current chain tip instead of genesis so the first sync

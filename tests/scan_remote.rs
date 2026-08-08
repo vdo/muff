@@ -9,6 +9,8 @@ fn make_config(url: &str) -> muff::config::Config {
         daemon: muff::config::DaemonConfig {
             url: url.to_string(),
             proxy: None,
+            nodes: Vec::new(),
+            use_public_nodes: false,
         },
         wallet: muff::config::WalletConfig {
             path: "/tmp/muff-test-unused".into(),

@@ -26,11 +26,17 @@ pub fn render_history(frame: &mut Frame, area: Rect, state: &AppState, regions: 
         .border_style(Style::default().fg(Color::Cyan));
 
     if state.transfers.is_empty() {
-        let empty_msg = Line::from(Span::styled(
+        let mut lines = vec![Line::from(Span::styled(
             "  No transactions found. Start syncing to discover transfers.",
             Style::default().fg(Color::DarkGray),
-        ));
-        let widget = ratatui::widgets::Paragraph::new(empty_msg).block(block);
+        ))];
+        if let Some(notice) = &state.history_notice {
+            lines.push(Line::from(Span::styled(
+                format!("  {notice}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        let widget = ratatui::widgets::Paragraph::new(lines).block(block);
         frame.render_widget(widget, area);
         return;
     }
@@ -153,8 +159,12 @@ pub fn render_history(frame: &mut Frame, area: Rect, state: &AppState, regions: 
 
     // Detail pane for the selected transfer.
     let selected = display.get(selected_display);
+    let detail_title = match &state.history_notice {
+        Some(notice) => format!(" {notice} "),
+        None => " Details (↑↓/Tab select, Enter full, [C] copy hash, [E] export CSV) ".to_string(),
+    };
     let detail_block = Block::default()
-        .title(" Details (↑↓/Tab select, Enter full, [C] copy hash) ")
+        .title(detail_title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
     let detail_lines = match selected {

@@ -1,6 +1,19 @@
 [daemon]
 url = "http://127.0.0.1:18081"
 
+# Fallback endpoints, tried in order when `url` stops responding for ~15s.
+# Nothing here is contacted while the primary is healthy.
+# nodes = ["http://192.168.1.10:18081"]
+
+# Also fall back to the bundled list of third-party public nodes.
+# Off by default: a public node operator sees your IP address and the
+# transactions you ask about, which is exactly what running your own node
+# avoids. The node picker labels these as third-party.
+# use_public_nodes = false
+
+# SOCKS proxy. Required before any .onion / .i2p endpoint is considered.
+# proxy = "socks5://127.0.0.1:9050"
+
 [wallet]
 path = "/Users/vdo/Library/Application Support/muff/muff.wallet"
 network = "mainnet"

@@ -96,13 +96,16 @@ enum WalletMode {
 /// Run the wallet setup wizard in the terminal (raw mode).
 pub fn run_wizard(
     wallet_path: &Path,
-    network: monero::Network,
+    network: crate::config::NetworkKind,
 ) -> color_eyre::Result<WizardResult> {
     let _terminal = WizardTerminalGuard::enter()?;
     wizard_inner(wallet_path, network)
 }
 
-fn wizard_inner(_wallet_path: &Path, network: monero::Network) -> color_eyre::Result<WizardResult> {
+fn wizard_inner(
+    _wallet_path: &Path,
+    network: crate::config::NetworkKind,
+) -> color_eyre::Result<WizardResult> {
     let stdout = io::stdout();
     let mut stdout = RawWriter(stdout);
 
@@ -134,15 +137,20 @@ fn wizard_inner(_wallet_path: &Path, network: monero::Network) -> color_eyre::Re
                     display_new_seed(&mut stdout, &mnemonic)?;
                     (seed, 0u64, true, Some(mnemonic.join(" ")))
                 }
+                SeedType::PolyseedDice => {
+                    let (mnemonic, seed, _birthday) = prompt_dice_entropy(&mut stdout)?;
+                    display_new_seed(&mut stdout, &mnemonic)?;
+                    (seed, 0u64, true, Some(mnemonic.join(" ")))
+                }
             }
         }
         WalletMode::Restore => {
-            let (seed, height, phrase) = prompt_seed_restore(&mut stdout)?;
+            let (seed, height, phrase) = prompt_seed_restore(&mut stdout, network)?;
             (seed, height, false, phrase)
         }
     };
 
-    let keys = wallet::derive_keys(&seed, network);
+    let keys = wallet::derive_keys(&seed, network.into());
 
     writeln!(stdout)?;
     writeln!(stdout, "  📬 Address: {}", keys.address_string())?;
@@ -163,6 +171,8 @@ fn wizard_inner(_wallet_path: &Path, network: monero::Network) -> color_eyre::Re
 enum SeedType {
     Standard,
     Polyseed,
+    /// Polyseed whose entropy is supplemented by physical dice or coin flips.
+    PolyseedDice,
 }
 
 /// Let the user pick between the classic 25-word seed and a 16-word
@@ -178,8 +188,12 @@ fn prompt_seed_type(stdout: &mut impl Write) -> color_eyre::Result<SeedType> {
         stdout,
         "  [2] Polyseed (16 words, embeds the wallet birthday)"
     )?;
+    writeln!(
+        stdout,
+        "  [3] Polyseed from dice rolls (you supply the entropy yourself)"
+    )?;
     writeln!(stdout)?;
-    write!(stdout, "  Choose (1/2): ")?;
+    write!(stdout, "  Choose (1/2/3): ")?;
     stdout.flush()?;
 
     loop {
@@ -193,11 +207,131 @@ fn prompt_seed_type(stdout: &mut impl Write) -> color_eyre::Result<SeedType> {
                     writeln!(stdout, "2")?;
                     return Ok(SeedType::Polyseed);
                 }
+                KeyCode::Char('3') => {
+                    writeln!(stdout, "3")?;
+                    return Ok(SeedType::PolyseedDice);
+                }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => abort(),
                 _ => {}
             }
         }
     }
+}
+
+/// Collect physical dice rolls or coin flips and turn them into a polyseed.
+///
+/// Only d6 and coins are offered: they are what people actually own, and
+/// single-keystroke entry keeps a 59-roll session tolerable. The underlying
+/// `polyseed_from_dice` takes any die size if that ever needs to change.
+///
+/// Worth being explicit with the user about what this does and does not buy
+/// them — the dice are mixed with the OS CSPRNG, so this hedges against a
+/// backdoored RNG without making a biased die dangerous.
+fn prompt_dice_entropy(
+    stdout: &mut impl Write,
+) -> color_eyre::Result<(Vec<String>, [u8; 32], u64)> {
+    writeln!(stdout)?;
+    writeln!(stdout, "  Entropy source:")?;
+    writeln!(stdout, "  [1] Six-sided dice (keys 1-6)")?;
+    writeln!(stdout, "  [2] Coin flips (h = heads, t = tails)")?;
+    writeln!(stdout)?;
+    write!(stdout, "  Choose (1/2): ")?;
+    stdout.flush()?;
+
+    let sides: u32 = loop {
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Char('1') => {
+                    writeln!(stdout, "1")?;
+                    break 6;
+                }
+                KeyCode::Char('2') => {
+                    writeln!(stdout, "2")?;
+                    break 2;
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => abort(),
+                _ => {}
+            }
+        }
+    };
+
+    let needed = wallet::dice_rolls_remaining(sides, 0);
+    let (noun, accepts) = if sides == 6 {
+        ("rolls", "1-6")
+    } else {
+        ("flips", "h/t")
+    };
+
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "  Enter {needed} {noun} ({accepts}). Backspace undoes the last one."
+    )?;
+    writeln!(
+        stdout,
+        "  Your {noun} are mixed with the system RNG, so the seed is never"
+    )?;
+    writeln!(
+        stdout,
+        "  weaker than a normal one — only harder to predict."
+    )?;
+    writeln!(stdout)?;
+
+    let mut rolls: Vec<String> = Vec::with_capacity(needed);
+
+    loop {
+        let remaining = wallet::dice_rolls_remaining(sides, rolls.len());
+        let bits = wallet::dice_entropy_per_roll(sides) * rolls.len() as f64;
+        write!(
+            stdout,
+            "\r\x1b[K  [{}/{}] {:.1}/{:.0} bits  ",
+            rolls.len(),
+            rolls.len() + remaining,
+            bits,
+            wallet::DICE_ENTROPY_BITS_NEEDED,
+        )?;
+        // Show only the tail: a 152-flip transcript will not fit on a line,
+        // and the point of the echo is confirming the last keypress landed.
+        let tail: Vec<&str> = rolls
+            .iter()
+            .rev()
+            .take(24)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        write!(stdout, "{}", tail.join(""))?;
+        if remaining == 0 {
+            write!(stdout, "  — Enter to accept")?;
+        }
+        stdout.flush()?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => abort(),
+            KeyCode::Esc => color_eyre::eyre::bail!("Cancelled"),
+            KeyCode::Backspace => {
+                rolls.pop();
+            }
+            KeyCode::Enter if remaining == 0 => {
+                writeln!(stdout)?;
+                break;
+            }
+            KeyCode::Char(c) if sides == 6 && ('1'..='6').contains(&c) => {
+                rolls.push(c.to_string());
+            }
+            KeyCode::Char(c) if sides == 2 && matches!(c.to_ascii_lowercase(), 'h' | 't') => {
+                // Feather records coin flips as H/T, and the transcript is
+                // part of the KDF input, so the casing has to match for the
+                // same flips to reproduce the same seed there.
+                rolls.push(c.to_ascii_uppercase().to_string());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(wallet::polyseed_from_dice(&rolls, sides))
 }
 
 fn prompt_create_or_restore(stdout: &mut impl Write) -> color_eyre::Result<WalletMode> {
@@ -269,6 +403,7 @@ fn display_new_seed(stdout: &mut impl Write, mnemonic: &[String]) -> color_eyre:
 /// Returns `(seed, scan_height, polyseed_phrase)`.
 fn prompt_seed_restore(
     stdout: &mut impl Write,
+    network: crate::config::NetworkKind,
 ) -> color_eyre::Result<([u8; 32], u64, Option<String>)> {
     writeln!(stdout)?;
     writeln!(stdout, "  Restore from seed phrase:")?;
@@ -284,14 +419,18 @@ fn prompt_seed_restore(
                 KeyCode::Char('1') => {
                     writeln!(stdout, "1")?;
                     let seed = prompt_seed_input(stdout)?;
-                    let height = prompt_scan_height(stdout)?;
+                    let height = prompt_scan_height(stdout, network)?;
                     return Ok((seed, height, None));
                 }
                 KeyCode::Char('2') => {
                     writeln!(stdout, "2")?;
                     let (seed, birthday, phrase) = prompt_polyseed_input(stdout)?;
-                    let height = wallet::birthday_to_height(birthday);
-                    writeln!(stdout, "  📅 Birthday → scan height: {}", height)?;
+                    // The polyseed carries its own birthday, so the user
+                    // never has to supply a date; route it through the same
+                    // checkpoint table for a tighter height than the linear
+                    // genesis estimate gives.
+                    let height = wallet::date_to_height(network, birthday);
+                    writeln!(stdout, "  📅 Birthday → scan height: {height}")?;
                     return Ok((seed, height, Some(phrase)));
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => abort(),
@@ -601,9 +740,28 @@ fn prompt_polyseed_input(stdout: &mut impl Write) -> color_eyre::Result<([u8; 32
     }
 }
 
-fn prompt_scan_height(stdout: &mut impl Write) -> color_eyre::Result<u64> {
+/// Ask where to start scanning, accepting either a block height or a date.
+///
+/// A date is what people actually remember about a seed, so it is offered
+/// first; it is resolved through the checkpoint table in
+/// `wallet::restore_height`, which deliberately errs early.
+fn prompt_scan_height(
+    stdout: &mut impl Write,
+    network: crate::config::NetworkKind,
+) -> color_eyre::Result<u64> {
+    const PROMPT: &str = "  Scan from (YYYY-MM-DD or block height, blank = genesis): ";
+
     writeln!(stdout)?;
-    write!(stdout, "  Scan from height (0 = genesis): ")?;
+    writeln!(
+        stdout,
+        "  When was this wallet created? A date is enough — muff converts it"
+    )?;
+    writeln!(
+        stdout,
+        "  to a block height and starts a few days earlier to be safe."
+    )?;
+    writeln!(stdout)?;
+    write!(stdout, "{PROMPT}")?;
     stdout.flush()?;
 
     let mut input = String::new();
@@ -612,24 +770,50 @@ fn prompt_scan_height(stdout: &mut impl Write) -> color_eyre::Result<u64> {
         if let Event::Key(key) = event::read()? {
             match key.code {
                 KeyCode::Enter => {
+                    let trimmed = input.trim();
+                    if trimmed.is_empty() {
+                        writeln!(stdout)?;
+                        writeln!(stdout, "  Scanning from genesis.")?;
+                        return Ok(0);
+                    }
+
+                    // A '-' can only mean a date; anything else is a height.
+                    if trimmed.contains('-') {
+                        match wallet::parse_date_to_height(network, trimmed) {
+                            Some(height) => {
+                                writeln!(stdout)?;
+                                writeln!(stdout, "  📅 {trimmed} → scan height {height}")?;
+                                return Ok(height);
+                            }
+                            None => {
+                                // Re-prompt in place rather than falling back
+                                // to 0: a silent full rescan would look like a
+                                // hang on mainnet.
+                                write!(stdout, "\r\x1b[K  ❌ Not a valid YYYY-MM-DD date.")?;
+                                stdout.flush()?;
+                                std::thread::sleep(std::time::Duration::from_millis(900));
+                                input.clear();
+                                write!(stdout, "\r\x1b[K{PROMPT}")?;
+                                stdout.flush()?;
+                                continue;
+                            }
+                        }
+                    }
+
                     writeln!(stdout)?;
-                    let height: u64 = input.trim().parse().unwrap_or(0);
-                    writeln!(stdout, "  Scanning from height: {}", height)?;
+                    let height: u64 = trimmed.parse().unwrap_or(0);
+                    writeln!(stdout, "  Scanning from height: {height}")?;
                     return Ok(height);
                 }
                 KeyCode::Backspace => {
                     input.pop();
-                    write!(
-                        stdout,
-                        "\r\x1b[K  Scan from height (0 = genesis): {}",
-                        input
-                    )?;
+                    write!(stdout, "\r\x1b[K{PROMPT}{input}")?;
                     stdout.flush()?;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => abort(),
-                KeyCode::Char(c) if c.is_ascii_digit() => {
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => {
                     input.push(c);
-                    write!(stdout, "{}", c)?;
+                    write!(stdout, "{c}")?;
                     stdout.flush()?;
                 }
                 KeyCode::Esc => {

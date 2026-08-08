@@ -29,6 +29,29 @@ pub enum SendField {
 /// Config). Node status is embedded in the dashboard.
 pub const TAB_COUNT: usize = 5;
 
+/// Consecutive failed status polls before rotating to the next node.
+///
+/// The poller runs every 5s, so this is ~15s of silence — long enough that a
+/// brief hiccup does not bounce the wallet between endpoints, short enough
+/// that a real outage does not strand a syncing wallet.
+const FAILOVER_AFTER_POLLS: u32 = 3;
+
+/// Whether a failed status poll should trigger rotation to the next node.
+///
+/// Split out from `AppState::consider_failover` so the policy is testable
+/// without a live daemon client: the caller has already established that the
+/// active node is down and bumped `failures`.
+fn should_fail_over(failures: u32, can_fail_over: bool, send_in_flight: bool) -> bool {
+    // Nowhere to go, or not yet convinced the node is really down.
+    if !can_fail_over || failures < FAILOVER_AFTER_POLLS {
+        return false;
+    }
+    // Retargeting drops the RPC client out from under whatever is using it.
+    // Mid-send that would abort a transaction the user is watching, so let
+    // the send finish (or fail on its own terms) first.
+    !send_in_flight
+}
+
 /// Which sensitive action the config-screen password gate protects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordPurpose {
@@ -96,6 +119,8 @@ pub enum ConfigModal {
         input: String,
         error: Option<String>,
     },
+    /// Pick a daemon from the failover pool.
+    NodePicker { selected: usize },
 }
 
 impl std::fmt::Debug for ConfigModal {
@@ -109,6 +134,7 @@ impl std::fmt::Debug for ConfigModal {
             ConfigModal::ChangePassword { .. } => f.write_str("ChangePassword(<redacted>)"),
             ConfigModal::Rescan { .. } => f.write_str("Rescan"),
             ConfigModal::DaemonAddress { .. } => f.write_str("DaemonAddress"),
+            ConfigModal::NodePicker { .. } => f.write_str("NodePicker"),
         }
     }
 }
@@ -209,6 +235,11 @@ pub struct AppState {
     // Connection
     pub daemon: DaemonClient,
     pub node_status: NodeStatus,
+    /// Ordered daemon endpoints to fall back through.
+    pub node_pool: crate::rpc::NodePool,
+    /// Consecutive failed status polls on the active node. Reset on every
+    /// successful poll; failover triggers at [`FAILOVER_AFTER_POLLS`].
+    node_failures: u32,
 
     // Wallet
     pub wallet_keys: Option<WalletKeys>,
@@ -231,6 +262,8 @@ pub struct AppState {
     /// Whether the transaction detail modal is open on the history screen
     /// (toggled with Enter; follows `history_selected`).
     pub history_detail: bool,
+    /// Result of the last CSV export, shown in the History footer.
+    pub history_notice: Option<String>,
     /// Highlighted row on the Addresses screen (0 = primary).
     pub receive_selected: usize,
     /// Full subaddress index whose outputs may fund outgoing transactions.
@@ -301,10 +334,13 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Self {
         let daemon = DaemonClient::new(&config);
+        let node_pool = crate::rpc::NodePool::new(&config);
         Self {
             config,
             daemon,
             node_status: NodeStatus::default(),
+            node_pool,
+            node_failures: 0,
             wallet_keys: None,
             balance: BalanceInfo::default(),
             owned_outputs: Vec::new(),
@@ -317,6 +353,7 @@ impl AppState {
             mouse_regions: Vec::new(),
             history_selected: 0,
             history_detail: false,
+            history_notice: None,
             receive_selected: 0,
             send_from_major: 0,
             send_from_minor: 0,
@@ -482,6 +519,7 @@ impl AppState {
             AppEvent::NodeStatus(status) => {
                 let was_disconnected = !self.node_status.connected;
                 self.node_status = status;
+                self.consider_failover();
                 // Unlock-height transitions change both the selected-address
                 // and whole-wallet available balances even without a newly
                 // discovered output.
@@ -989,6 +1027,7 @@ impl AppState {
                 self.load_persisted_state();
                 self.force_status_refresh = true;
                 self.last_error = None;
+                self.history_notice = None;
                 return;
             }
             // Left/Right (and h/l) move between screens; Tab moves focus
@@ -1023,6 +1062,12 @@ impl AppState {
     /// Home/End to jump, 'c' to copy the selected transaction hash.
     /// `history_selected` is in display order: 0 = newest (top row).
     fn handle_history_keys(&mut self, key: crossterm::event::KeyEvent) {
+        // Export is handled before the empty guard so pressing [E] with no
+        // transfers reports why nothing happened rather than doing nothing.
+        if key.code == KeyCode::Char('E') {
+            self.export_history_csv();
+            return;
+        }
         let len = self.transfers.len();
         if len == 0 {
             return;
@@ -1056,8 +1101,45 @@ impl AppState {
                     copy_to_clipboard(&hash);
                 }
             }
+            // [E] = Shift+E exports the whole history to CSV.
+            KeyCode::Char('E') => self.export_history_csv(),
             _ => {}
         }
+    }
+
+    /// Write the full transaction history to a timestamped CSV next to the
+    /// wallet file, and report where it landed.
+    ///
+    /// The wallet directory is the one place guaranteed to exist and be
+    /// writable, and it keeps an export that names amounts and transaction
+    /// ids out of a shared location like the home directory or /tmp.
+    fn export_history_csv(&mut self) {
+        if self.transfers.is_empty() {
+            self.history_notice = Some("Nothing to export yet.".to_string());
+            return;
+        }
+
+        let dir = self
+            .config
+            .wallet
+            .path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = dir.join(crate::wallet::default_filename(chrono::Utc::now()));
+
+        let csv = crate::wallet::history_to_csv(&self.transfers);
+        self.history_notice = match std::fs::write(&path, csv) {
+            Ok(()) => {
+                let count = self.transfers.len();
+                tracing::info!("exported {count} transfers to {}", path.display());
+                Some(format!("Exported {count} transfers to {}", path.display()))
+            }
+            Err(e) => {
+                tracing::warn!("history export failed: {e:#}");
+                Some(format!("Export failed: {e}"))
+            }
+        };
     }
 
     fn handle_send_keys(&mut self, key: crossterm::event::KeyEvent) {
@@ -1569,7 +1651,7 @@ impl AppState {
     /// Enter activates the selected option.
     fn handle_config_keys(&mut self, key: crossterm::event::KeyEvent) {
         /// Number of actionable option rows on the config screen.
-        const CONFIG_OPTIONS: usize = 5;
+        const CONFIG_OPTIONS: usize = 6;
         match key.code {
             KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
                 self.config_selected = self.config_selected.saturating_sub(1);
@@ -1626,8 +1708,40 @@ impl AppState {
                     error: None,
                 };
             }
+            // 5 = "Switch node".
+            5 => {
+                self.config_modal = ConfigModal::NodePicker {
+                    selected: self.node_pool.active_index(),
+                };
+            }
             _ => {}
         }
+    }
+
+    /// Switch to the pool entry at `index` without touching the configured
+    /// primary — this is a "use that one for now", not a config change.
+    fn select_pool_node(&mut self, index: usize) {
+        let Some(candidate) = self.node_pool.candidates().get(index).cloned() else {
+            return;
+        };
+        self.config_modal = ConfigModal::Hidden;
+        self.node_pool.select(&candidate.url);
+        self.node_failures = 0;
+        self.config_notice = Some(format!("Connecting to {}…", candidate.url));
+
+        if let Some(cancel) = &self.scan_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.scanner_started = false;
+        self.node_status.connected = false;
+
+        let daemon = self.daemon.clone();
+        tokio::spawn(async move {
+            daemon.set_url(&candidate.url).await;
+            if let Err(e) = daemon.connect().await {
+                tracing::warn!("connect to {} failed: {e:#}", candidate.url);
+            }
+        });
     }
 
     /// Handle keys while a config-screen modal is open.
@@ -1767,6 +1881,24 @@ impl AppState {
                 }
                 _ => {}
             },
+            ConfigModal::NodePicker { selected } => {
+                let len = self.node_pool.candidates().len();
+                match key.code {
+                    KeyCode::Esc => self.config_modal = ConfigModal::Hidden,
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                        self.config_modal = ConfigModal::NodePicker {
+                            selected: selected.saturating_sub(1),
+                        };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                        self.config_modal = ConfigModal::NodePicker {
+                            selected: (selected + 1).min(len.saturating_sub(1)),
+                        };
+                    }
+                    KeyCode::Enter => self.select_pool_node(selected),
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -2001,6 +2133,11 @@ impl AppState {
         }
         let normalized = crate::rpc::normalize_url(url);
         self.config.daemon.url = normalized.clone();
+        // An explicit choice overrides failover: re-seed the pool from the
+        // new config so the primary really is primary again.
+        self.node_pool = crate::rpc::NodePool::new(&self.config);
+        self.node_pool.select(&normalized);
+        self.node_failures = 0;
         self.config_notice = match &self.config_path {
             Some(path) => match self.config.save(path) {
                 Ok(()) => Some(format!("Daemon set to {normalized} — reconnecting…")),
@@ -2329,6 +2466,57 @@ impl AppState {
         self.recalculate_balance();
     }
 
+    /// Track consecutive status-poll failures and rotate to the next node
+    /// once the active one looks genuinely down.
+    ///
+    /// Waiting for several failures rather than reacting to the first keeps a
+    /// momentary blip from bouncing the wallet between nodes; at the poller's
+    /// 5s cadence this is roughly 15 seconds of silence before moving.
+    fn consider_failover(&mut self) {
+        if self.node_status.connected {
+            self.node_failures = 0;
+            return;
+        }
+
+        self.node_failures = self.node_failures.saturating_add(1);
+
+        if !should_fail_over(
+            self.node_failures,
+            self.node_pool.can_fail_over(),
+            self.send_in_flight(),
+        ) {
+            return;
+        }
+
+        let Some(next) = self.node_pool.advance().cloned() else {
+            return;
+        };
+        self.node_failures = 0;
+
+        // Surfaced to the user through the dashboard log pane; the Node
+        // panel's "Using: fallback" line carries the ongoing state.
+        tracing::warn!(
+            "primary node unreachable — failing over to {} [{}]",
+            next.url,
+            next.source.label()
+        );
+
+        // Stop the scanner; the NodeStatus auto-start brings it back up on
+        // the new node once the connection is established.
+        if let Some(cancel) = &self.scan_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.scanner_started = false;
+
+        let daemon = self.daemon.clone();
+        tokio::spawn(async move {
+            daemon.set_url(&next.url).await;
+            if let Err(e) = daemon.connect().await {
+                tracing::warn!("failover connect to {} failed: {e:#}", next.url);
+            }
+        });
+    }
+
     /// Attempt to connect to the daemon.
     pub async fn try_connect(&mut self) {
         match self.daemon.connect().await {
@@ -2380,5 +2568,40 @@ impl AppState {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holds_off_until_the_node_looks_really_down() {
+        for failures in 1..FAILOVER_AFTER_POLLS {
+            assert!(
+                !should_fail_over(failures, true, false),
+                "rotated after only {failures} failed poll(s)"
+            );
+        }
+        assert!(should_fail_over(FAILOVER_AFTER_POLLS, true, false));
+    }
+
+    #[test]
+    fn never_rotates_with_nowhere_to_go() {
+        assert!(!should_fail_over(FAILOVER_AFTER_POLLS + 10, false, false));
+    }
+
+    /// Switching nodes mid-send would drop the RPC client under a
+    /// transaction the user is watching.
+    #[test]
+    fn waits_for_an_in_flight_send() {
+        assert!(!should_fail_over(FAILOVER_AFTER_POLLS, true, true));
+        // ...and goes ahead once the send is done.
+        assert!(should_fail_over(FAILOVER_AFTER_POLLS, true, false));
+    }
+
+    #[test]
+    fn a_long_outage_keeps_rotating() {
+        assert!(should_fail_over(u32::MAX, true, false));
     }
 }

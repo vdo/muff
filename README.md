@@ -17,13 +17,18 @@ in a single encrypted wallet file.
 
 - Encrypted wallet file (`muff.wallet`): ChaCha20-Poly1305 encryption with
   an Argon2-derived key.
-- Polyseed (16-word) and legacy 25-word mnemonic support
-- First-run wizard: create a new wallet or restore from seed
+- Polyseed (16-word) and legacy 25-word mnemonic support, optionally seeded
+  from your own dice rolls or coin flips
+- First-run wizard: create a new wallet or restore from seed, entering either
+  a block height or just the date the wallet was created
+- Daemon failover: extra nodes are tried in order when the primary goes
+  quiet, with an optional bundled list of public nodes
 - Tabs: **Dashboard** (balance, node status, recent activity, logs),
   **Send** (fee priority tiers, sweep-all, address book), **Addresses**
   (per-address balances, send-source selection, QR codes), **History**
-  (chronological transfers with details), **Config** (password-gated seed/key reveal, change
-  password, change daemon)
+  (chronological transfers with details, CSV export), **Config**
+  (password-gated seed/key reveal, change password, change daemon,
+  switch node)
 - Outgoing transactions tracked through broadcast → mined → dropped states
 - Mouse support (clickable tabs, rows, buttons)
 - Passwords and keys zeroized in memory when no longer needed
@@ -40,6 +45,15 @@ The binary is at `target/release/muff`.
 
 You need a reachable Monero daemon RPC endpoint — ideally your own local
 [Cuprate](https://github.com/Cuprate/cuprate) node or `monerod`.
+
+If the primary node stops answering for ~15 seconds, muff moves to the next
+endpoint in `daemon.nodes` and keeps syncing; the Node panel says which one is
+in use whenever it is not your configured primary. Setting
+`daemon.use_public_nodes = true` adds a bundled list of third-party public
+nodes to the end of that rotation. It is off by default on purpose — a public
+node sees your IP address and the transactions you ask about. `.onion`/`.i2p`
+endpoints are only offered when `daemon.proxy` is set, since they cannot
+resolve otherwise.
 
 ```sh
 ./target/release/muff
@@ -73,6 +87,10 @@ Example against a local stagenet node:
 - New seeds are 32 bytes (256 bits) of entropy from the OS CSPRNG
   (`rand::thread_rng` → ChaCha12, seeded by `getrandom`) — the same class
   of randomness used by other software wallets; as safe as your machine is.
+- If you would rather not take the CSPRNG's word for it, option [3] in the
+  wizard builds a Polyseed from dice rolls or coin flips. The rolls are
+  *mixed with* system entropy rather than replacing it, so a biased die or a
+  miscount cannot make the seed weaker than a normal one.
 - That said, again, this is young, AI-written code: prefer running it against
   your **own** node, on **stagenet/testnet**, or with **small mainnet amounts**
   you can afford to lose.
@@ -97,6 +115,12 @@ Muff transactions or daemon traffic are perfectly indistinguishable from
 those produced by the reference wallet.
 
 ## Acknowledgements
+
+The restore-height checkpoint tables and the public node list in `assets/`
+are vendored from [Feather](https://github.com/feather-wallet/feather)
+(BSD-3-Clause; see `assets/README.md` and `assets/LICENSE.feather`). The
+dice-entropy scheme follows Feather's `SeedDiceDialog`, so the same rolls
+produce the same seed in both wallets.
 
 Built on the Monero ecosystem's Rust crates:
 
