@@ -96,10 +96,10 @@ async fn main() -> Result<()> {
     // the new default name) is missing but a legacy `wallet.enc` sits next
     // to it, rename the legacy file into place.
     if config.wallet.path.file_name() == Some(std::ffi::OsStr::new("muff.wallet"))
-        && detect_format(&config.wallet.path) == WalletFileFormat::Missing
+        && detect_format(&config.wallet.path)? == WalletFileFormat::Missing
     {
         let legacy = config.wallet.path.with_file_name("wallet.enc");
-        if detect_format(&legacy) == WalletFileFormat::EncryptedDb {
+        if detect_format(&legacy)? == WalletFileFormat::EncryptedDb {
             std::fs::rename(&legacy, &config.wallet.path)?;
             // The legacy file may predate owner-only permissions; tighten
             // it now rather than waiting for the first save.
@@ -122,7 +122,8 @@ async fn main() -> Result<()> {
     tracing::info!("Starting muff with daemon at {}", config.daemon.url);
 
     // Wallet setup: use wizard for new wallets, password prompt for existing
-    let (wallet_keys, scan_height, password, wallet_db) = match detect_format(&config.wallet.path) {
+    let wallet_format = detect_format(&config.wallet.path)?;
+    let (wallet_keys, scan_height, password, wallet_db) = match wallet_format {
         WalletFileFormat::EncryptedDb => {
             // Existing wallet — just prompt for password
             eprintln!("Wallet found at {}", config.wallet.path.display());
@@ -144,6 +145,13 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
+            let stored_network = db.network()?;
+            let configured_network = config.wallet.network.as_str();
+            if stored_network != configured_network {
+                return Err(color_eyre::eyre::eyre!(
+                    "wallet network is {stored_network}, but configuration selects {configured_network}; refusing to derive or scan with the wrong network"
+                ));
+            }
             let seed = match db.seed() {
                 Ok(seed) => seed,
                 Err(e) => {
@@ -185,12 +193,12 @@ async fn main() -> Result<()> {
             };
 
             // Create the encrypted single-file wallet database
-            let network = format!("{:?}", config.wallet.network).to_lowercase();
+            let network = config.wallet.network.as_str();
             let db = WalletDb::create(
                 &config.wallet.path,
                 wizard_result.password.as_bytes(),
                 &wizard_result.keys.seed,
-                &network,
+                network,
                 scan_height,
             )?;
             // Polyseed wallets: remember the format and the original phrase

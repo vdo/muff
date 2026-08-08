@@ -8,7 +8,9 @@ pub mod send;
 pub mod state;
 
 pub use balance::{BalanceInfo, OwnedOutput, TransferDirection, TransferRecord};
-pub use db::{AddressBookEntry, SeedFormat, WalletDb, WalletFileFormat, detect_format};
+pub use db::{
+    AddressBookEntry, MIN_NEW_PASSWORD_CHARS, SeedFormat, WalletDb, WalletFileFormat, detect_format,
+};
 pub use keys::{WalletKeys, derive_keys, format_xmr, generate_seed, sc_reduce32};
 pub use mnemonic::{
     MnemonicError, autocomplete, generate_mnemonic_seed, is_valid_word, mnemonic_to_seed,

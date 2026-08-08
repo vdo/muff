@@ -35,8 +35,14 @@ pub enum SendEvent {
         fee: u64,
         inputs: usize,
     },
-    /// The transaction was published to the daemon.
-    Published { tx_hash: String, fee: u64 },
+    /// The transaction was published to the daemon. A warning means local
+    /// bookkeeping could not be durably persisted and must not be mistaken
+    /// for a failed broadcast.
+    Published {
+        tx_hash: String,
+        fee: u64,
+        warning: Option<String>,
+    },
     /// Sending failed.
     Failed(String),
 }
@@ -217,30 +223,22 @@ fn stage(event_tx: &mpsc::UnboundedSender<AppEvent>, msg: impl Into<String>) {
 
 /// Assemble a `SignableTransaction` paying `amount` to `recipient`.
 ///
-/// Change returns to the primary address; the outgoing view key is derived
-/// deterministically (`Hs("muff outgoing view key" || view_secret)`) so a
-/// payment can always be proven from the wallet seed alone.
+/// Change returns to the primary address. The outgoing view key is generated
+/// independently for each construction attempt; reusing a wallet-wide value
+/// leaks a stable secret into every transaction construction.
 fn build_signable(
     keys: &crate::wallet::WalletKeys,
     inputs: Vec<OutputWithDecoys>,
     recipient: MoneroAddress,
     amount: u64,
     fee_rate: FeeRate,
+    rng: &mut (impl rand::RngCore + rand::CryptoRng),
 ) -> Result<SignableTransaction> {
     let view_pair = crate::wallet::scanner::build_view_pair(keys)?;
     let change = Change::new(view_pair, None);
 
-    // Deterministic outgoing view key: Hs("muff outgoing view key" || view_secret).
-    let ovk = {
-        let mut preimage = b"muff outgoing view key".to_vec();
-        preimage.extend_from_slice(keys.viewpair.view.as_bytes());
-        let scalar = Scalar::hash(preimage);
-        let mut bytes = Zeroizing::new([0u8; 32]);
-        scalar
-            .write(&mut bytes.as_mut_slice())
-            .expect("write to a 32-byte slice cannot fail");
-        bytes
-    };
+    let mut ovk = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(ovk.as_mut());
 
     SignableTransaction::new(
         RctType::ClsagBulletproofPlus,
@@ -404,7 +402,7 @@ async fn send_inner(
     // payment of the (weight-identical) second.
     stage(event_tx, "Constructing transaction");
     let input_count = inputs.len();
-    let mut signable = build_signable(keys, inputs.clone(), recipient, amount, fee_rate)?;
+    let mut signable = build_signable(keys, inputs.clone(), recipient, amount, fee_rate, &mut rng)?;
     let mut fee = signable.necessary_fee();
     if req.sweep_all {
         let total: u64 = selected.iter().map(|(_, o)| o.commitment().amount).sum();
@@ -414,7 +412,7 @@ async fn send_inner(
             }
             fee_estimate = fee;
             amount = sweep_payment(total, fee)?;
-            signable = build_signable(keys, inputs.clone(), recipient, amount, fee_rate)?;
+            signable = build_signable(keys, inputs.clone(), recipient, amount, fee_rate, &mut rng)?;
             let refined = signable.necessary_fee();
             if refined == fee {
                 break;
@@ -484,10 +482,7 @@ async fn send_inner(
         &req.address[..8.min(req.address.len())],
         &req.address[req.address.len().saturating_sub(6)..]
     );
-    for (stored, _) in &selected {
-        db.mark_spent_by(&stored.key_hex, &tx_hash)?;
-    }
-    db.insert_history(&TransferRecord {
+    let record = TransferRecord {
         tx_hash: tx_hash.clone(),
         height: 0,
         timestamp: std::time::SystemTime::now()
@@ -500,12 +495,34 @@ async fn send_inner(
         confirmed: false,
         failed: false,
         note,
-    })?;
-    if let Err(e) = db.save() {
-        tracing::warn!("failed to save state after send: {e}");
-    }
+    };
+    let input_keys: Vec<String> = selected
+        .iter()
+        .map(|(stored, _)| stored.key_hex.clone())
+        .collect();
+    let warning = match db.record_published_transfer(&input_keys, &record) {
+        Err(e) => {
+            tracing::error!("published transaction bookkeeping failed: {e:#}");
+            Some(format!(
+                "Transaction {tx_hash} was published, but wallet bookkeeping failed. Do not retry this payment; rescan the wallet before spending again."
+            ))
+        }
+        Ok(()) => match db.save() {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::error!("failed to persist state after published transaction: {e:#}");
+                Some(format!(
+                    "Transaction {tx_hash} was published, but its wallet state was not saved. Do not retry this payment; keep the wallet open and rescan before spending again."
+                ))
+            }
+        },
+    };
 
-    let _ = event_tx.send(AppEvent::Send(SendEvent::Published { tx_hash, fee }));
+    let _ = event_tx.send(AppEvent::Send(SendEvent::Published {
+        tx_hash,
+        fee,
+        warning,
+    }));
     Ok(())
 }
 

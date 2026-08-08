@@ -39,6 +39,16 @@ pub enum NetworkKind {
     Testnet,
 }
 
+impl NetworkKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Stagenet => "stagenet",
+            Self::Testnet => "testnet",
+        }
+    }
+}
+
 impl From<NetworkKind> for monero::Network {
     fn from(n: NetworkKind) -> Self {
         match n {

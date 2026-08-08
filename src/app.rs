@@ -11,8 +11,8 @@ use crate::event::AppEvent;
 use crate::logbuf::LogBuffer;
 use crate::rpc::{DaemonClient, NodeStatus};
 use crate::wallet::{
-    BalanceInfo, OwnedOutput, ScanEvent, Scanner, SendEvent, SendPriority, SendRequest,
-    TransferDirection, TransferRecord, WalletDb, WalletKeys, format_xmr,
+    BalanceInfo, MIN_NEW_PASSWORD_CHARS, OwnedOutput, ScanEvent, Scanner, SendEvent, SendPriority,
+    SendRequest, TransferDirection, TransferRecord, WalletDb, WalletKeys, format_xmr,
 };
 
 /// Which input field is focused on the send screen.
@@ -591,12 +591,19 @@ impl AppState {
                     // the user must review it before anything is broadcast.
                     self.active_tab = 1;
                 }
-                SendEvent::Published { tx_hash, fee } => {
+                SendEvent::Published {
+                    tx_hash,
+                    fee,
+                    warning,
+                } => {
                     self.send_stage = SendStage::Done { tx_hash, fee };
                     self.send_confirm_tx = None;
                     // Reload state: the engine marked inputs spent and added
                     // the outgoing transfer record.
                     self.load_persisted_state();
+                    if let Some(warning) = warning {
+                        self.last_error = Some(warning);
+                    }
                 }
                 SendEvent::Failed(msg) => {
                     self.send_stage = SendStage::Failed(msg);
@@ -1698,10 +1705,12 @@ impl AppState {
                 }
             }
             ChangePwStage::New => {
-                if first.len() < 4 {
+                if first.chars().count() < MIN_NEW_PASSWORD_CHARS {
                     self.config_modal = rebuild(
                         stage,
-                        Some("Use at least 4 characters for the new password".into()),
+                        Some(format!(
+                            "Use at least {MIN_NEW_PASSWORD_CHARS} characters for the new password"
+                        )),
                     );
                     return;
                 }

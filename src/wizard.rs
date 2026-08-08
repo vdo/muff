@@ -8,7 +8,7 @@ use std::path::Path;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 
 use zeroize::Zeroizing;
@@ -41,8 +41,34 @@ impl<W: Write> Write for RawWriter<W> {
 /// Abort the wizard: restore the terminal and exit with the SIGINT exit code.
 fn abort() -> ! {
     let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen);
     println!("\nAborted.");
     std::process::exit(130);
+}
+
+/// Keeps setup (including a newly generated seed phrase) out of the normal
+/// terminal scrollback and restores terminal state on every ordinary exit.
+struct WizardTerminalGuard;
+
+impl WizardTerminalGuard {
+    fn enter() -> color_eyre::Result<Self> {
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        if let Err(e) = enable_raw_mode() {
+            let _ = execute!(stdout, LeaveAlternateScreen);
+            return Err(e.into());
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for WizardTerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen);
+    }
 }
 
 /// Result of the wallet setup wizard.
@@ -72,10 +98,8 @@ pub fn run_wizard(
     wallet_path: &Path,
     network: monero::Network,
 ) -> color_eyre::Result<WizardResult> {
-    enable_raw_mode()?;
-    let result = wizard_inner(wallet_path, network);
-    disable_raw_mode()?;
-    result
+    let _terminal = WizardTerminalGuard::enter()?;
+    wizard_inner(wallet_path, network)
 }
 
 fn wizard_inner(_wallet_path: &Path, network: monero::Network) -> color_eyre::Result<WizardResult> {
@@ -623,8 +647,11 @@ fn prompt_password(_stdout: &mut impl Write) -> color_eyre::Result<Zeroizing<Str
 
     let password = loop {
         let pw = rpassword::prompt_password("  🔒 Set wallet password: ")?;
-        if pw.is_empty() {
-            eprintln!("  Password cannot be empty.");
+        if pw.chars().count() < wallet::MIN_NEW_PASSWORD_CHARS {
+            eprintln!(
+                "  Use at least {} characters.",
+                wallet::MIN_NEW_PASSWORD_CHARS
+            );
             continue;
         }
         let pw2 = rpassword::prompt_password("  🔒 Confirm password: ")?;

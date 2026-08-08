@@ -11,6 +11,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
+use zeroize::Zeroize;
 
 use monero_wallet::block::Block;
 use monero_wallet::interface::ScannableBlock;
@@ -82,6 +83,12 @@ pub struct Scanner {
     cancel: Arc<AtomicBool>,
     /// Last time key-image spentness was checked (throttled).
     last_ki_check: Option<std::time::Instant>,
+}
+
+impl Drop for Scanner {
+    fn drop(&mut self) {
+        self.spend_scalar.zeroize();
+    }
 }
 
 impl Scanner {
@@ -495,13 +502,10 @@ impl Scanner {
                 continue;
             };
             let txid = hex::encode(txid_bytes);
-            let confirmed_now = match self.db.confirm_out_transfer(&txid, height, timestamp) {
-                Ok(hit) => hit,
-                Err(e) => {
-                    tracing::warn!("failed to update transfer confirmation: {e}");
-                    false
-                }
-            };
+            // Do not advance past a block whose wallet mutations could not be
+            // committed. Reprocessing is safe because the updates are
+            // idempotent.
+            let confirmed_now = self.db.confirm_out_transfer(&txid, height, timestamp)?;
             if confirmed_now {
                 let _ = self
                     .event_tx
@@ -581,14 +585,12 @@ impl Scanner {
         let found = match self.wallet_scanner.scan(scannable) {
             Ok(found) => found,
             Err(monero_wallet::ScanError::UnsupportedProtocol(v)) => {
-                // Future protocol version we don't understand; skip rather
-                // than wedge the wallet forever. The block hash is still
-                // recorded so chain-continuity checks keep working.
-                tracing::warn!("skipping block {block_height}: unsupported protocol v{v}");
-                if let Err(e) = self.db.push_hash(block_height, &hex::encode(block_hash)) {
-                    tracing::warn!("failed to record block hash: {e}");
-                }
-                return Ok(BlockOutcome::Scanned(block_height));
+                // Advancing would permanently hide every wallet output in an
+                // unsupported block. Stop at this exact height until the
+                // wallet is upgraded.
+                return Err(color_eyre::eyre::eyre!(
+                    "block {block_height} uses unsupported protocol v{v}; upgrade muff before continuing"
+                ));
             }
             Err(e) => {
                 return Err(color_eyre::eyre::eyre!(
@@ -598,11 +600,9 @@ impl Scanner {
         };
 
         for output in found.ignore_additional_timelock() {
-            self.record_output(output, block_height, timestamp, hardfork);
+            self.record_output(output, block_height, timestamp, hardfork)?;
         }
-        if let Err(e) = self.db.push_hash(block_height, &hex::encode(block_hash)) {
-            tracing::warn!("failed to record block hash: {e}");
-        }
+        self.db.push_hash(block_height, &hex::encode(block_hash))?;
         Ok(BlockOutcome::Scanned(block_height))
     }
 
@@ -747,7 +747,13 @@ impl Scanner {
     }
 
     /// Record a found output into wallet state and notify the UI.
-    fn record_output(&mut self, output: WalletOutput, height: u64, timestamp: u64, _hardfork: u8) {
+    fn record_output(
+        &mut self,
+        output: WalletOutput,
+        height: u64,
+        timestamp: u64,
+        _hardfork: u8,
+    ) -> Result<()> {
         let key_hex = hex::encode(output.key().compress().to_bytes());
         let tx_hash = hex::encode(output.transaction());
         let amount = output.commitment().amount;
@@ -778,10 +784,11 @@ impl Scanner {
         // `process_block`, which also covers zero-change transactions.)
         match self.db.insert_received_output(&stored, &tx_hash, &note) {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return Ok(()),
             Err(e) => {
-                tracing::warn!("failed to record output {key_hex}: {e}");
-                return;
+                return Err(color_eyre::eyre::eyre!(
+                    "record wallet output {key_hex}: {e}"
+                ));
             }
         }
 
@@ -799,6 +806,7 @@ impl Scanner {
                 timestamp,
                 unlock_height,
             })));
+        Ok(())
     }
 
     /// Ask the daemon about every outgoing transfer we believe is still in
@@ -888,16 +896,31 @@ impl Scanner {
                 return;
             }
         };
-        let key_images: Vec<String> = outputs
+        // Keep every derived image attached to the exact output it belongs to.
+        // Filtering images into a separate vector and later zipping with
+        // `outputs` shifts the response onto the wrong wallet rows whenever a
+        // corrupt/unreadable output is skipped.
+        let outputs_with_images: Vec<(&StoredOutput, String)> = outputs
             .iter()
-            .filter_map(|o| crate::wallet::send::key_image_for_stored(o, &self.spend_scalar))
+            .filter_map(|output| {
+                match crate::wallet::send::key_image_for_stored(output, &self.spend_scalar) {
+                    Some(image) => Some((output, image)),
+                    None => {
+                        tracing::warn!(
+                            "cannot derive key image for stored output {}; leaving its state unchanged",
+                            output.key_hex
+                        );
+                        None
+                    }
+                }
+            })
             .collect();
-        if key_images.is_empty() {
+        if outputs_with_images.is_empty() {
             return;
         }
 
-        for chunk in key_images.chunks(200) {
-            let images: Vec<String> = chunk.to_vec();
+        for chunk in outputs_with_images.chunks(200) {
+            let images: Vec<String> = chunk.iter().map(|(_, image)| image.clone()).collect();
             let statuses = match self.daemon.is_key_images_spent(&images).await {
                 Ok(statuses) => statuses,
                 Err(e) => {
@@ -909,7 +932,7 @@ impl Scanner {
             let mut spent_events = Vec::new();
             let mut unspent_events = Vec::new();
             let mut failed_txs = Vec::new();
-            for (output, status) in outputs.iter().zip(statuses.iter()) {
+            for ((output, _), status) in chunk.iter().zip(statuses.iter()) {
                 // 0 = unspent, 1 = spent on-chain, 2 = in pool.
                 if *status != 0 {
                     if !output.spent {

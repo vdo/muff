@@ -14,8 +14,8 @@
 //!
 //! - KDF: Argon2id (19 MiB, t=2, p=1) — password stretching; wrong-password
 //!   detection comes free from the Poly1305 authentication tag.
-//! - All writes are atomic (tmp file + rename), so a crash can never corrupt
-//!   the wallet file.
+//! - Writes use a synced temp file followed by an atomic rename, preserving
+//!   the previous wallet image if a save is interrupted before replacement.
 //! - While the wallet is locked (auto-lock), this struct — and with it the
 //!   in-memory database and the derived key — is dropped.
 
@@ -42,6 +42,10 @@ const ARGON_M_KIB: u32 = 19 * 1024;
 const ARGON_T: u32 = 2;
 const ARGON_P: u32 = 1;
 
+/// Minimum length enforced when the UI creates or changes a password.
+/// Existing shorter passwords remain unlockable for compatibility.
+pub const MIN_NEW_PASSWORD_CHARS: usize = 12;
+
 /// How many recent block hashes are kept for reorg detection.
 const RECENT_HASH_WINDOW: u64 = 1024;
 
@@ -49,6 +53,9 @@ const RECENT_HASH_WINDOW: u64 = 1024;
 pub struct WalletDb {
     conn: Mutex<Connection>,
     path: PathBuf,
+    /// Serializes complete snapshot writes so an older serialization can
+    /// never finish after and overwrite a newer one.
+    save_lock: Mutex<()>,
     /// Encryption parameters (kept for saves; replaced on password change).
     /// The key is zeroized on drop.
     enc: Mutex<DbEncryption>,
@@ -101,33 +108,38 @@ fn decrypt(key: &[u8; 32], nonce: &[u8], ct: &[u8]) -> Result<Zeroizing<Vec<u8>>
 fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
-        .and_then(|mut f| f.write_all(bytes))
+        .with_context(|| format!("write {}", path.display()))?;
+    file.write_all(bytes)
         .with_context(|| format!("write {}", path.display()))?;
     // `mode` only applies when the file is created; force the permissions
-    // too in case a stale temp file with looser ones was reused.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod {}", path.display()))
+    // too as a defense in depth measure.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    // Atomic rename alone is not power-loss durability: flush both file data
+    // and metadata before it becomes the live wallet image.
+    file.sync_all()
+        .with_context(|| format!("sync {}", path.display()))
 }
 
 /// Detect which on-disk wallet format a path holds.
-pub fn detect_format(path: &Path) -> WalletFileFormat {
+pub fn detect_format(path: &Path) -> std::io::Result<WalletFileFormat> {
     match std::fs::read(path) {
         Ok(bytes) => {
             if bytes.starts_with(MAGIC) {
-                WalletFileFormat::EncryptedDb
+                Ok(WalletFileFormat::EncryptedDb)
             } else if bytes.first() == Some(&b'{') {
-                WalletFileFormat::LegacyJson
+                Ok(WalletFileFormat::LegacyJson)
             } else {
-                WalletFileFormat::Unknown
+                Ok(WalletFileFormat::Unknown)
             }
         }
-        Err(_) => WalletFileFormat::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(WalletFileFormat::Missing),
+        Err(e) => Err(e),
     }
 }
 
@@ -193,6 +205,7 @@ impl WalletDb {
         let db = Self {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
+            save_lock: Mutex::new(()),
             enc: Mutex::new(DbEncryption { key: enc_key, salt }),
         };
         db.save()?;
@@ -223,6 +236,7 @@ impl WalletDb {
         Ok(Self {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
+            save_lock: Mutex::new(()),
             enc: Mutex::new(DbEncryption { key: enc_key, salt }),
         })
     }
@@ -296,6 +310,13 @@ impl WalletDb {
 
     /// Encrypt and atomically persist the current database image.
     pub fn save(&self) -> Result<()> {
+        let _save_guard = self.save_lock.lock().unwrap();
+        let mut replaced = false;
+        self.save_locked(&mut replaced)
+    }
+
+    /// Persist while the caller holds `save_lock`.
+    fn save_locked(&self, replaced: &mut bool) -> Result<()> {
         // `serialize` borrows the connection; copy out so the lock is
         // released before the (slower) encryption step.
         let image: Zeroizing<Vec<u8>> = {
@@ -321,15 +342,40 @@ impl WalletDb {
         file_bytes.extend_from_slice(&nonce);
         file_bytes.extend_from_slice(&ct);
 
-        let tmp = self.path.with_extension("dbtmp");
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
+        let mut suffix = [0u8; 8];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut suffix);
+        let file_name = self
+            .path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("wallet"))
+            .to_string_lossy();
+        let tmp_name = format!(
+            ".{file_name}.{}.{}.dbtmp",
+            std::process::id(),
+            hex::encode(suffix)
+        );
+        let parent = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let tmp = parent.join(tmp_name);
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        let result = (|| -> Result<()> {
+            write_owner_only(&tmp, &file_bytes)?;
+            std::fs::rename(&tmp, &self.path)
+                .with_context(|| format!("rename to {}", self.path.display()))?;
+            *replaced = true;
+            // Persist the directory entry update as well as the file itself.
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .with_context(|| format!("sync directory {}", parent.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        write_owner_only(&tmp, &file_bytes)?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("rename to {}", self.path.display()))?;
-        Ok(())
+        result
     }
 
     pub fn path(&self) -> &Path {
@@ -343,12 +389,30 @@ impl WalletDb {
         let mut salt = [0u8; SALT_LEN];
         rand::Rng::fill(&mut rand::thread_rng(), &mut salt);
         let key = derive_key(new_password, &salt)?;
-        {
+        let _save_guard = self.save_lock.lock().unwrap();
+        let old = {
             let mut enc = self.enc.lock().unwrap();
-            enc.key = Zeroizing::new(key);
-            enc.salt = salt;
+            std::mem::replace(
+                &mut *enc,
+                DbEncryption {
+                    key: Zeroizing::new(key),
+                    salt,
+                },
+            )
+        };
+        let mut replaced = false;
+        if let Err(e) = self.save_locked(&mut replaced) {
+            if replaced {
+                // The live file already uses the new password. Keep the
+                // matching in-memory key and report success rather than make
+                // the caller retain a password that can no longer unlock it.
+                tracing::warn!("wallet password changed, but directory sync failed: {e:#}");
+                return Ok(());
+            }
+            *self.enc.lock().unwrap() = old;
+            return Err(e);
         }
-        self.save()
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -473,8 +537,9 @@ impl WalletDb {
         tx_hash: &str,
         note: &str,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let n = conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
             "INSERT OR IGNORE INTO outputs
              (key_hex, wallet_output_hex, amount, height, timestamp, spent, spent_tx)
              VALUES(?1, ?2, ?3, ?4, ?5, 0, NULL)",
@@ -489,7 +554,7 @@ impl WalletDb {
         if n == 0 {
             return Ok(false);
         }
-        conn.execute(
+        tx.execute(
             "INSERT INTO history
              (tx_hash, height, timestamp, amount, fee, direction, confirmed, failed, note)
              VALUES(?1, ?2, ?3, ?4, 0, 'In', 1, 0, ?5)",
@@ -501,6 +566,7 @@ impl WalletDb {
                 note,
             ],
         )?;
+        tx.commit()?;
         Ok(true)
     }
 
@@ -633,6 +699,44 @@ impl WalletDb {
             "UPDATE outputs SET spent=1, spent_tx=?1 WHERE key_hex=?2",
             params![txid, key_hex],
         )?;
+        Ok(())
+    }
+
+    /// Atomically reserve all inputs and add the pending outgoing history
+    /// record after a transaction has been published.
+    pub fn record_published_transfer(
+        &self,
+        input_keys: &[String],
+        record: &TransferRecord,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for key_hex in input_keys {
+            let changed = tx.execute(
+                "UPDATE outputs SET spent=1, spent_tx=?1
+                 WHERE key_hex=?2 AND (spent_tx IS NULL OR spent_tx=?1)",
+                params![record.tx_hash, key_hex],
+            )?;
+            if changed != 1 {
+                bail!("published input {key_hex} is missing or reserved by another transfer");
+            }
+        }
+        tx.execute(
+            "INSERT INTO history
+             (tx_hash, height, timestamp, amount, fee, direction, confirmed, failed, note)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'Out', ?6, ?7, ?8)",
+            params![
+                record.tx_hash,
+                record.height as i64,
+                record.timestamp as i64,
+                record.amount as i64,
+                record.fee as i64,
+                record.confirmed as i64,
+                record.failed as i64,
+                record.note,
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -898,7 +1002,7 @@ mod tests {
             db.save().unwrap();
         }
         // File format is detected as the encrypted db.
-        assert_eq!(detect_format(&path), WalletFileFormat::EncryptedDb);
+        assert_eq!(detect_format(&path).unwrap(), WalletFileFormat::EncryptedDb);
         // Header leaks nothing about contents; no SQLite magic present.
         let raw = std::fs::read(&path).unwrap();
         assert!(raw.starts_with(MAGIC));
@@ -942,11 +1046,19 @@ mod tests {
     #[test]
     fn test_detect_format() {
         let path = temp_path("muff.wallet");
-        assert_eq!(detect_format(&path), WalletFileFormat::Missing);
+        assert_eq!(detect_format(&path).unwrap(), WalletFileFormat::Missing);
         std::fs::write(&path, b"{\"version\":1}").unwrap();
-        assert_eq!(detect_format(&path), WalletFileFormat::LegacyJson);
+        assert_eq!(detect_format(&path).unwrap(), WalletFileFormat::LegacyJson);
         std::fs::write(&path, b"garbage-bytes").unwrap();
-        assert_eq!(detect_format(&path), WalletFileFormat::Unknown);
+        assert_eq!(detect_format(&path).unwrap(), WalletFileFormat::Unknown);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_detect_format_does_not_treat_read_errors_as_missing() {
+        let path = temp_path("wallet-directory");
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(detect_format(&path).is_err());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -1211,6 +1323,57 @@ mod tests {
         let db = WalletDb::open(&path, b"pw").unwrap();
         assert_eq!(db.seed_format(), SeedFormat::Polyseed);
         assert_eq!(db.polyseed_phrase().unwrap().as_deref(), Some(phrase));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_failed_password_change_restores_old_encryption_key() {
+        let path = temp_path("muff.wallet");
+        let mut db = WalletDb::create(&path, b"old-pw", &[6u8; 32], "mainnet", 0).unwrap();
+
+        // Renaming a temp file over an existing directory fails before the
+        // wallet image is replaced, exercising password-change rollback.
+        let invalid_target = path.parent().unwrap().join("existing-directory");
+        std::fs::create_dir(&invalid_target).unwrap();
+        db.path = invalid_target;
+        assert!(db.set_password(b"new-pw").is_err());
+
+        db.path = path.clone();
+        db.save().unwrap();
+        drop(db);
+        assert!(WalletDb::open(&path, b"old-pw").is_ok());
+        assert!(WalletDb::open(&path, b"new-pw").is_err());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_published_transfer_bookkeeping_is_atomic() {
+        let path = temp_path("muff.wallet");
+        let db = WalletDb::create(&path, b"pw", &[9u8; 32], "mainnet", 0).unwrap();
+        db.insert_received_output(&test_output("input-a", 400, 10), "in-a", "n")
+            .unwrap();
+        db.insert_received_output(&test_output("input-b", 600, 11), "in-b", "n")
+            .unwrap();
+        db.mark_spent_by("input-b", "another-transfer").unwrap();
+
+        let record = out_record("published-transfer", 0);
+        assert!(
+            db.record_published_transfer(&["input-a".into(), "input-b".into()], &record)
+                .is_err()
+        );
+        // The first update was rolled back along with the conflict on the
+        // second input, and no partial history row escaped the transaction.
+        let (outputs, history) = db.ui_snapshot().unwrap();
+        let input_a = outputs.iter().find(|o| o.key_hex == "input-a").unwrap();
+        assert!(!input_a.spent);
+        assert!(!history.iter().any(|r| r.tx_hash == "published-transfer"));
+
+        db.release_output("input-b").unwrap();
+        db.record_published_transfer(&["input-a".into(), "input-b".into()], &record)
+            .unwrap();
+        let (outputs, history) = db.ui_snapshot().unwrap();
+        assert!(outputs.iter().all(|output| output.spent));
+        assert!(history.iter().any(|r| r.tx_hash == "published-transfer"));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

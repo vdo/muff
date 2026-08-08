@@ -37,11 +37,18 @@ impl WalletKeys {
     pub fn address_string(&self) -> String {
         self.primary_address().to_string()
     }
+
+    fn zeroize_secrets(&mut self) {
+        self.seed.zeroize();
+        self.keypair.spend.scalar.zeroize();
+        self.keypair.view.scalar.zeroize();
+        self.viewpair.view.scalar.zeroize();
+    }
 }
 
 impl Drop for WalletKeys {
     fn drop(&mut self) {
-        self.seed.zeroize();
+        self.zeroize_secrets();
     }
 }
 
@@ -333,19 +340,12 @@ mod tests {
     }
 
     #[test]
-    fn test_wallet_keys_drop_zeroizes_seed() {
-        let seed_ptr;
-        {
-            let keys = derive_keys(&[0xAA; 32], Network::Mainnet);
-            seed_ptr = keys.seed.as_ptr();
-            assert_eq!(keys.seed, [0xAA; 32]);
-        }
-        unsafe {
-            let bytes = std::slice::from_raw_parts(seed_ptr, 32);
-            assert!(
-                bytes.iter().all(|&b| b == 0),
-                "Seed should be zeroized after drop"
-            );
-        }
+    fn test_wallet_keys_zeroizes_all_private_material() {
+        let mut keys = derive_keys(&[0xAA; 32], Network::Mainnet);
+        keys.zeroize_secrets();
+        assert!(keys.seed.iter().all(|byte| *byte == 0));
+        assert!(keys.keypair.spend.as_bytes().iter().all(|byte| *byte == 0));
+        assert!(keys.keypair.view.as_bytes().iter().all(|byte| *byte == 0));
+        assert!(keys.viewpair.view.as_bytes().iter().all(|byte| *byte == 0));
     }
 }

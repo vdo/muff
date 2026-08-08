@@ -12,7 +12,7 @@ use monero_wallet::interface::{
     ProvidesUnvalidatedDecoys, ProvidesUnvalidatedFeeRates, TransactionsError,
 };
 
-use crate::config::Config;
+use crate::config::{Config, NetworkKind};
 
 use super::bin;
 
@@ -60,6 +60,9 @@ pub struct DaemonClient {
     proxy: Option<String>,
     /// reqwest client for binary (`*.bin`) and ad-hoc JSON endpoints.
     http: reqwest::Client,
+    /// Refuse nodes serving a different chain before the scanner or send
+    /// engine can consume any of their data.
+    expected_network: NetworkKind,
     /// Cached cumulative RingCT output distribution (absolute counts).
     rct_distribution_cache: Arc<Mutex<Option<Arc<CachedDistribution>>>>,
 }
@@ -131,6 +134,7 @@ impl DaemonClient {
             url: Arc::new(RwLock::new(normalize_url(&config.daemon.url))),
             proxy: config.daemon.proxy.clone(),
             http,
+            expected_network: config.wallet.network,
             rct_distribution_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -153,12 +157,13 @@ impl DaemonClient {
 
     /// Attempt to connect to the daemon and cache the client.
     pub async fn connect(&self) -> Result<()> {
+        let url = self.url().await;
         let mut builder = RpcClientBuilder::new();
         if let Some(ref proxy) = self.proxy {
             builder = builder.proxy_address(proxy);
         }
         let client = builder
-            .build(&self.url().await)
+            .build(&url)
             .map_err(|e| color_eyre::eyre::eyre!("Failed to build RPC client: {}", e))?;
 
         // Test connection by calling get_block_count
@@ -169,6 +174,31 @@ impl DaemonClient {
             .await
             .map_err(|e| color_eyre::eyre::eyre!("RPC connection test failed: {}", e))?;
 
+        let status = self.get_status_at(&url).await;
+        if !status.connected {
+            return Err(color_eyre::eyre::eyre!(
+                "daemon status check failed: {}",
+                status.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+        let expected = self.expected_network.as_str();
+        if status.net_type != expected {
+            return Err(color_eyre::eyre::eyre!(
+                "daemon network mismatch: wallet uses {expected}, daemon reports {}",
+                status.net_type
+            ));
+        }
+
+        // Do not install a client for an endpoint that was replaced while
+        // its connection/status checks were in flight. Holding the URL read
+        // guard through installation also makes `set_url` clear this client
+        // if it begins immediately afterwards.
+        let current_url = self.url.read().await;
+        if *current_url != url {
+            return Err(color_eyre::eyre::eyre!(
+                "daemon URL changed while connecting; retrying with the new endpoint"
+            ));
+        }
         let mut guard = self.inner.write().await;
         *guard = Some(DaemonInner { client });
         Ok(())
@@ -176,7 +206,12 @@ impl DaemonClient {
 
     /// Get the current node status by querying the /get_info endpoint directly.
     pub async fn get_status(&self) -> NodeStatus {
-        let url = format!("{}/get_info", self.url().await);
+        let url = self.url().await;
+        self.get_status_at(&url).await
+    }
+
+    async fn get_status_at(&self, base_url: &str) -> NodeStatus {
+        let url = format!("{base_url}/get_info");
         // Use the configured client so proxy settings (e.g. Tor) apply and
         // timeouts are bounded.
         match self.http.get(&url).send().await {
