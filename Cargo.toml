@@ -1,0 +1,56 @@
+[package]
+name = "muff"
+version = "0.1.0"
+edition = "2024"
+description = "A Monero wallet TUI for use with a local Cuprate node"
+license = "MIT"
+
+[dependencies]
+# TUI
+ratatui = { version = "0.30", features = ["crossterm"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+# Monero
+monero = { version = "0.22", features = ["serde"] }
+monero-rpc = "0.5"
+monero-wallet = "0.2"
+curve25519-dalek = "4"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "socks"] }
+futures = "0.3"
+
+# Serialization / Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling / Logging
+color-eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+hex = "0.4"
+dirs = "6"
+zeroize = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+unicode-width = "0.2"
+rpassword = "7"
+arboard = "3"
+qrcode = { version = "0.14", default-features = false }
+
+# Encrypted wallet database
+rusqlite = { version = "0.32", features = ["bundled", "serialize"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

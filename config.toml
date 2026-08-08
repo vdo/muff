@@ -1,0 +1,10 @@
+[daemon]
+url = "http://127.0.0.1:18081"
+
+[wallet]
+path = "/Users/vdo/Library/Application Support/muff/muff.wallet"
+network = "mainnet"
+
+[ui]
+tick_rate_ms = 100
+show_atomic = false
