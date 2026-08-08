@@ -176,11 +176,34 @@ fn render_node(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(vec![
             Span::styled("  URL:      ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                truncate_middle(&state.config.daemon.url, value_budget),
+                // The node actually in use, which failover can move away
+                // from the configured primary. Showing `config.daemon.url`
+                // here would claim a healthy connection to a node we are not
+                // talking to.
+                truncate_middle(
+                    state
+                        .node_pool
+                        .active()
+                        .map(|c| c.url.as_str())
+                        .unwrap_or(&state.config.daemon.url),
+                    value_budget,
+                ),
                 Style::default().fg(Color::White),
             ),
         ]),
     ];
+
+    if let Some(active) = state.node_pool.active()
+        && active.source != crate::rpc::NodeSource::Primary
+    {
+        node_lines.push(Line::from(vec![
+            Span::styled("  Using:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("fallback [{}]", active.source.label()),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
 
     if let Some(ref err) = ns.error {
         node_lines.push(Line::from(vec![

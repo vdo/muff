@@ -238,6 +238,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("    PgUp/PgDn         scroll a page"),
         Line::from("    Home/End          first / last"),
         Line::from("    [C]               copy transaction hash"),
+        Line::from("    [E]               export history to CSV"),
         Line::from(""),
         Line::from(Span::styled(
             "  Config",

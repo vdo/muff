@@ -13,12 +13,13 @@ use crate::ui::{Regions, centered_rect};
 
 /// The actionable option rows, in display order (name, dim hint).
 /// `app.rs::activate_config_option` maps the index to the action.
-const OPTIONS: [(&str, &str); 5] = [
+const OPTIONS: [(&str, &str); 6] = [
     ("Reveal seed phrase", "requires wallet password"),
     ("Reveal private keys", "requires wallet password"),
     ("Change wallet password", "requires current password"),
     ("Rescan blockchain from height", "rescans outputs & history"),
     ("Change daemon address", "saved to config file"),
+    ("Switch node", "pick from the failover pool"),
 ];
 
 /// Render the config screen.
@@ -168,7 +169,83 @@ pub fn render_config_modal(frame: &mut Frame, area: Rect, state: &AppState) {
         ConfigModal::DaemonAddress { input, error } => {
             render_daemon_address(frame, area, state, input, error)
         }
+        ConfigModal::NodePicker { selected } => render_node_picker(frame, area, state, *selected),
     }
+}
+
+/// The failover pool, with the active node marked and third-party nodes
+/// labelled as such.
+fn render_node_picker(frame: &mut Frame, area: Rect, state: &AppState, selected: usize) {
+    let candidates = state.node_pool.candidates();
+    let mut lines: Vec<Line> = vec![Line::from("")];
+
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No daemon endpoints configured.",
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let active = state.node_pool.active_index();
+    for (i, candidate) in candidates.iter().enumerate() {
+        let marker = if i == active { "●" } else { " " };
+        let style = if i == selected {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else if i == active {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        // Third-party nodes get a colour of their own: picking one has
+        // privacy consequences the other two sources do not.
+        let source_style = match candidate.source {
+            crate::rpc::NodeSource::Public => Style::default().fg(Color::Yellow),
+            _ => Style::default().fg(Color::DarkGray),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {marker} "), style),
+            Span::styled(candidate.url.clone(), style),
+            Span::styled(format!("  [{}]", candidate.source.label()), source_style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    if candidates
+        .iter()
+        .any(|c| c.source == crate::rpc::NodeSource::Public)
+    {
+        lines.push(Line::from(Span::styled(
+            "  Public nodes see your IP and the transactions you ask about.",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓: select    Enter: connect    Esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Switching here is temporary; the config file keeps its primary.",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Size to the content: the pool is anywhere from one node to a dozen,
+    // and a fixed height would either clip the list or float in whitespace.
+    let width = candidates
+        .iter()
+        .map(|c| c.url.len() + c.source.label().len() + 12)
+        .max()
+        .unwrap_or(40)
+        .clamp(52, 96) as u16;
+    let popup = centered_rect(area, width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, popup);
+
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Switch node ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    frame.render_widget(widget, popup);
 }
 
 /// The masked password prompt shown before a secret is revealed.

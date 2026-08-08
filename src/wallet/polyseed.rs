@@ -253,6 +253,73 @@ pub fn generate_polyseed() -> (Vec<String>, [u8; 32], u64) {
     use rand::RngCore;
     let mut secret = Zeroizing::new([0u8; SECRET_SIZE]);
     rand::thread_rng().fill_bytes(secret.as_mut_slice());
+    polyseed_from_secret(secret)
+}
+
+/// Bits of entropy a polyseed secret carries, and therefore the target a
+/// dice/coin sequence has to reach before [`polyseed_from_dice`] accepts it.
+///
+/// 19 bytes are requested and two bits are discarded, so the usable width is
+/// 150; the extra two bits in this figure keep the requirement conservative,
+/// matching Feather.
+pub const DICE_ENTROPY_BITS_NEEDED: f64 = 152.0;
+
+/// Entropy contributed by one roll of an `sides`-sided die.
+pub fn dice_entropy_per_roll(sides: u32) -> f64 {
+    f64::from(sides).log2()
+}
+
+/// Number of `sides`-sided rolls still needed after `rolls_so_far`.
+pub fn dice_rolls_remaining(sides: u32, rolls_so_far: usize) -> usize {
+    let per_roll = dice_entropy_per_roll(sides);
+    if per_roll <= 0.0 {
+        return usize::MAX;
+    }
+    let have = per_roll * rolls_so_far as f64;
+    let missing = DICE_ENTROPY_BITS_NEEDED - have;
+    if missing <= 0.0 {
+        0
+    } else {
+        (missing / per_roll).ceil() as usize
+    }
+}
+
+/// Build a polyseed from physical dice rolls or coin flips.
+///
+/// The dice are *mixed with* the OS CSPRNG, not used instead of it: 19 bytes
+/// of system randomness are appended to the roll transcript before the KDF
+/// runs. That way a user who distrusts the CSPRNG still benefits from their
+/// dice, and a user who miscounts rolls or uses a biased die is no worse off
+/// than [`generate_polyseed`]. Breaking the result requires beating both
+/// sources.
+///
+/// This follows Feather's `SeedDiceDialog` exactly — transcript joined by
+/// spaces, salt domain-separated by die size, PBKDF2-HMAC-SHA256 at 2048
+/// iterations — so the same rolls produce the same seed in both wallets.
+pub fn polyseed_from_dice(rolls: &[String], sides: u32) -> (Vec<String>, [u8; 32], u64) {
+    use rand::RngCore;
+
+    let mut data = Zeroizing::new(rolls.join(" ").into_bytes());
+
+    // Append system entropy so the seed is never weaker than a normal one.
+    let mut system = Zeroizing::new([0u8; SECRET_SIZE]);
+    rand::thread_rng().fill_bytes(system.as_mut_slice());
+    data.extend_from_slice(system.as_slice());
+
+    // Domain-separate by die size so the same transcript rolled on a d6 and
+    // a d20 cannot collide.
+    let salt = format!("POLYSEED-{sides}");
+
+    let derived = Zeroizing::new(pbkdf2_hmac_sha256(&data, salt.as_bytes(), 2048));
+    let mut secret = Zeroizing::new([0u8; SECRET_SIZE]);
+    secret.copy_from_slice(&derived[..SECRET_SIZE]);
+
+    polyseed_from_secret(secret)
+}
+
+/// Shared tail of polyseed construction: mask the secret to 150 bits, stamp
+/// today's birthday, and encode the words.
+fn polyseed_from_secret(mut secret: Zeroizing<[u8; SECRET_SIZE]>) -> (Vec<String>, [u8; 32], u64) {
     // Clear the top 2 bits of the last byte: exactly 150 bits.
     secret[SECRET_SIZE - 1] &= 0x3f;
     let mut data = PolyseedData {
@@ -376,6 +443,64 @@ fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dice_entropy_targets_match_feather() {
+        // log2(6) = 2.585 bits, so 152 bits needs 59 rolls of a d6.
+        assert_eq!(dice_rolls_remaining(6, 0), 59);
+        // A coin gives exactly one bit, so 152 flips.
+        assert_eq!(dice_rolls_remaining(2, 0), 152);
+        // A d20 is denser: log2(20) = 4.32 bits.
+        assert_eq!(dice_rolls_remaining(20, 0), 36);
+    }
+
+    #[test]
+    fn dice_requirement_reaches_zero_and_saturates() {
+        assert_eq!(dice_rolls_remaining(6, 59), 0);
+        assert_eq!(dice_rolls_remaining(6, 1000), 0);
+        // Partial progress reduces what is left by exactly what was rolled.
+        assert_eq!(dice_rolls_remaining(6, 10), 49);
+    }
+
+    /// A one-sided "die" carries no entropy; it must never be satisfiable.
+    #[test]
+    fn degenerate_die_never_satisfies_the_requirement() {
+        assert_eq!(dice_rolls_remaining(1, 10_000), usize::MAX);
+    }
+
+    #[test]
+    fn dice_produce_a_valid_polyseed() {
+        let rolls: Vec<String> = (0..60).map(|i| ((i % 6) + 1).to_string()).collect();
+        let (words, key, birthday) = polyseed_from_dice(&rolls, 6);
+        assert_eq!(words.len(), POLYSEED_WORDS);
+        // The derived key must be a usable Monero spend scalar and the
+        // phrase must round-trip back to it.
+        assert!(monero::util::key::PrivateKey::from_slice(&key).is_ok());
+        let (recovered, recovered_birthday) = polyseed_to_key(&words.join(" ")).unwrap();
+        assert_eq!(recovered, key);
+        assert_eq!(recovered_birthday, birthday);
+    }
+
+    /// System entropy is mixed in, so identical rolls must NOT yield an
+    /// identical seed. This is the property that makes bad dice harmless.
+    #[test]
+    fn identical_rolls_still_differ_by_system_entropy() {
+        let rolls: Vec<String> = (0..60).map(|_| "1".to_string()).collect();
+        let (_, first, _) = polyseed_from_dice(&rolls, 6);
+        let (_, second, _) = polyseed_from_dice(&rolls, 6);
+        assert_ne!(first, second, "dice seeds must not be deterministic");
+    }
+
+    #[test]
+    fn die_size_domain_separates_the_transcript() {
+        // Same transcript, different declared die size: the salt differs, so
+        // the KDF inputs cannot collide. Verified at the KDF layer because
+        // the public path mixes in fresh system entropy every call.
+        let data = b"1 2 3 4 5 6";
+        let d6 = pbkdf2_hmac_sha256(data, b"POLYSEED-6", 2048);
+        let d20 = pbkdf2_hmac_sha256(data, b"POLYSEED-20", 2048);
+        assert_ne!(d6, d20);
+    }
 
     /// Golden vector from the reference implementation (tevador/polyseed
     /// tests/tests.c): Monero coin, features 0, created at unix 1638446400

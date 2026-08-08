@@ -21,6 +21,18 @@ pub struct DaemonConfig {
     pub url: String,
     /// Optional proxy (e.g. socks5://127.0.0.1:9050 for Tor)
     pub proxy: Option<String>,
+    /// Additional endpoints to fall back to when `url` stops responding,
+    /// tried in order. Your own nodes: nothing here is contacted unless the
+    /// primary fails.
+    #[serde(default)]
+    pub nodes: Vec<String>,
+    /// Also fall back to the bundled list of third-party public nodes.
+    ///
+    /// Off by default, and deliberately so: a public node operator sees the
+    /// IP address behind every request and can link it to the transactions
+    /// you ask about. Enable it only if that trade is acceptable.
+    #[serde(default)]
+    pub use_public_nodes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +105,8 @@ impl Default for Config {
             daemon: DaemonConfig {
                 url: "http://127.0.0.1:18081".to_string(),
                 proxy: None,
+                nodes: Vec::new(),
+                use_public_nodes: false,
             },
             wallet: WalletConfig {
                 path: wallet_dir.join("muff.wallet"),
@@ -144,5 +158,53 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Configs written before the failover fields existed must keep loading.
+    #[test]
+    fn older_configs_without_node_fields_still_parse() {
+        let toml = r#"
+[daemon]
+url = "http://127.0.0.1:18081"
+
+[wallet]
+path = "/tmp/muff.wallet"
+network = "stagenet"
+
+[ui]
+tick_rate_ms = 100
+show_atomic = false
+"#;
+        let config: Config = toml::from_str(toml).expect("legacy config should parse");
+        assert_eq!(config.daemon.url, "http://127.0.0.1:18081");
+        assert!(config.daemon.nodes.is_empty());
+        // Absent must mean "do not contact strangers".
+        assert!(!config.daemon.use_public_nodes);
+        assert_eq!(config.wallet.network, NetworkKind::Stagenet);
+    }
+
+    #[test]
+    fn node_fields_round_trip_through_toml() {
+        let mut config = Config::default();
+        config.daemon.nodes = vec!["http://a:1".to_string()];
+        config.daemon.use_public_nodes = true;
+
+        let rendered = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(parsed.daemon.nodes, config.daemon.nodes);
+        assert!(parsed.daemon.use_public_nodes);
+    }
+
+    #[test]
+    fn the_shipped_example_config_parses() {
+        let raw = include_str!("../config.toml");
+        let config: Config = toml::from_str(raw).expect("config.toml should parse");
+        // The example must not opt users into third-party nodes.
+        assert!(!config.daemon.use_public_nodes);
     }
 }
