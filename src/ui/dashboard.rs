@@ -31,45 +31,75 @@ pub fn render_dashboard(frame: &mut Frame, area: Rect, state: &AppState) {
     render_logs(frame, chunks[2], state);
 }
 
-/// Top-left pane: wallet balance.
+/// Top-left pane: selected send-source balance and whole-wallet totals.
 fn render_balance(frame: &mut Frame, area: Rect, state: &AppState) {
     let balance_block = Block::default()
-        .title(" Balance ")
+        .title(" Balances ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
 
-    let total_str = format_xmr(state.balance.total);
-    let unlocked_str = format_xmr(state.balance.unlocked);
-    let locked_str = format_xmr(state.balance.locked);
-
+    let current = state.current_address_balance();
     let mut balance_text = vec![
         Line::from(vec![
-            Span::styled("  Total:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Current · ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                total_str,
+                state.current_address_label(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("    Balance:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_xmr(current.total),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(""),
         Line::from(vec![
-            Span::styled("  Available:", Style::default().fg(Color::DarkGray)),
-            Span::styled(unlocked_str, Style::default().fg(Color::Green)),
+            Span::styled("    Available: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_xmr(current.unlocked),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "  Total wallet",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("    Balance:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_xmr(state.balance.total),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("  Locked:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(locked_str, Style::default().fg(Color::Red)),
+            Span::styled("    Available: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_xmr(state.balance.unlocked),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("    Locked:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_xmr(state.balance.locked),
+                Style::default().fg(Color::Red),
+            ),
         ]),
     ];
 
-    // The primary address sits under the balance in the spare rows.
-    if let Some(ref keys) = state.wallet_keys {
-        let addr = keys.address_string();
+    if let Some(addr) = state.current_address_string() {
         let short = truncate_middle(&addr, 24);
-        balance_text.push(Line::from(""));
         balance_text.push(Line::from(vec![
-            Span::styled("  Address:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  From: ", Style::default().fg(Color::DarkGray)),
             Span::styled(short, Style::default().fg(Color::White)),
         ]));
     }

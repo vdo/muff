@@ -4,6 +4,21 @@ version = "0.3.0"
 edition = "2024"
 description = "A Monero wallet TUI for use with a local Cuprate node"
 license = "MIT"
+# Dependency-driven floor: monero-wallet declares rustc 1.89 (the ratatui
+# crates and time want 1.88). Our own code only needs 1.87 (is_multiple_of in
+# wallet/send.rs). CI and releases pin an exact toolchain; this value is the
+# lower bound clippy's incompatible_msrv lint enforces against, and it is
+# verified by a real build in the `msrv` CI job.
+rust-version = "1.89"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# Explicitly NOT `panic = "abort"`. The TUI holds the terminal in raw mode on
+# the alternate screen; unwinding is what allows a panic to be reported
+# legibly rather than leaving the user with an unusable terminal.
+panic = "unwind"
 
 [dependencies]
 # TUI

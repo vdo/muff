@@ -95,7 +95,7 @@ pub fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
 /// Registers a clickable [`MouseRegion::Tab`] for each tab title so the bar
 /// works with the mouse.
 pub fn render_tabs(frame: &mut Frame, area: Rect, active_tab: usize, regions: &mut Regions) {
-    let tabs = ["Dashboard", "Send", "Receive", "History", "Config"];
+    let tabs = ["Dashboard", "Send", "Addresses", "History", "Config"];
 
     // Register click targets: each title is rendered as `│ Name `, so tab i
     // occupies `1 + name.len() + 2` columns starting at the running offset.
@@ -187,7 +187,9 @@ pub fn layout_main(area: Rect) -> (Rect, Rect, Rect, Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Header
-            Constraint::Length(3), // Tabs
+            // One text row plus the bottom separator. A third row leaves a
+            // visually empty gap between navigation and the active screen.
+            Constraint::Length(2), // Tabs
             Constraint::Min(0),    // Content
             Constraint::Length(3), // Footer
         ])

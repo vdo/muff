@@ -363,6 +363,10 @@ pub struct SendRequest {
     pub sweep_all: bool,
     /// Fee priority tier.
     pub priority: FeePriority,
+    /// Exact `(account, minor)` subaddress whose outputs may fund this send.
+    /// This is intentionally not a preference: silently crossing the source
+    /// boundary would defeat the Addresses screen's privacy control.
+    pub source: (u32, u32),
 }
 
 /// Compute the payment of a sweep transaction: everything minus the fee.
@@ -476,19 +480,31 @@ fn stage(event_tx: &mpsc::UnboundedSender<AppEvent>, msg: impl Into<String>) {
 
 /// Assemble a `SignableTransaction` paying `amount` to `recipient`.
 ///
-/// Change returns to the primary address. The outgoing view key is generated
-/// independently for each construction attempt; reusing a wallet-wide value
-/// leaks a stable secret into every transaction construction.
+/// Change returns to minor 0 of the selected source account, matching
+/// wallet2's `create_transactions_2` policy. The outgoing view key is
+/// generated independently for each construction attempt; reusing a
+/// wallet-wide value leaks a stable secret into every construction.
 fn build_signable(
     keys: &crate::wallet::WalletKeys,
     inputs: Vec<OutputWithDecoys>,
     recipient: MoneroAddress,
     amount: u64,
     fee_rate: FeeRate,
+    source: (u32, u32),
     rng: &mut (impl rand::RngCore + rand::CryptoRng),
 ) -> Result<SignableTransaction> {
     let view_pair = crate::wallet::scanner::build_view_pair(keys)?;
-    let change = Change::new(view_pair, None);
+    // wallet2.cpp: change_dts.addr = get_subaddress({subaddr_account, 0}).
+    // Account 0/minor 0 is the legacy primary address represented by `None`.
+    let change_subaddress = if source.0 == 0 {
+        None
+    } else {
+        Some(
+            monero_wallet::address::SubaddressIndex::new(source.0, 0)
+                .ok_or_else(|| color_eyre::eyre::eyre!("invalid change subaddress"))?,
+        )
+    };
+    let change = Change::new(view_pair, change_subaddress);
 
     let mut ovk = Zeroizing::new([0u8; 32]);
     rng.fill_bytes(ovk.as_mut());
@@ -557,12 +573,20 @@ async fn send_inner(
             tracing::warn!("skipping corrupt stored output {}", stored.key_hex);
             continue;
         };
-        if is_unlocked(&output, stored, tip_u64) {
+        let subaddress = output
+            .subaddress()
+            .map(|index| (index.account(), index.address()))
+            .unwrap_or((0, 0));
+        if subaddress == req.source && is_unlocked(&output, stored, tip_u64) {
             spendable.push((stored.clone(), output));
         }
     }
     if spendable.is_empty() {
-        return Err(color_eyre::eyre::eyre!("no unlocked outputs available"));
+        return Err(color_eyre::eyre::eyre!(
+            "no unlocked outputs available in subaddress {}/{}",
+            req.source.0,
+            req.source.1
+        ));
     }
 
     let estimate_weight = |inputs: usize| -> u64 {
@@ -623,9 +647,9 @@ async fn send_inner(
                 if spendable.is_empty() {
                     break;
                 }
-                // Combining subaddresses is a last resort. wallet2 can split
-                // the payment into multiple transactions; this single-tx UI
-                // only crosses the boundary when no one group can fund it.
+                // The candidate set was pre-filtered to the user's explicit
+                // source. This fallback can therefore never cross into a
+                // different receiving identity.
                 active = take_largest_subaddress_group(&mut spendable);
             }
             let candidate = pop_least_related(&mut active, &selected, false, &mut rng);
@@ -680,7 +704,9 @@ async fn send_inner(
         }
         if selected_sum < req.amount.saturating_add(fee_estimate) {
             return Err(color_eyre::eyre::eyre!(
-                "insufficient unlocked balance: have {} + fee, need {}",
+                "insufficient unlocked balance in subaddress {}/{}: have {} + fee, need {}",
+                req.source.0,
+                req.source.1,
                 crate::wallet::format_xmr(selected_sum),
                 crate::wallet::format_xmr(req.amount)
             ));
@@ -695,12 +721,10 @@ async fn send_inner(
     //
     // IMPORTANT: muff implements NO decoy-selection algorithm of its own.
     // Selection is delegated entirely to the `monero-wallet` crate:
-    // `OutputWithDecoys::new` (monero-wallet/src/decoys.rs) reproduces the
-    // official wallet2 algorithm — a Gamma(19.28, 1/1.61) output-age
-    // distribution sampled against the daemon's RingCT output distribution
-    // (cf. monero-project/monero src/wallet/wallet2.cpp `get_outs`, around
-    // L142-L143). The daemon client only supplies the raw distribution and
-    // decoy key data through monero-wallet's `ProvidesDecoys` interface.
+    // `OutputWithDecoys::new` (monero-wallet/src/decoys.rs) implements the
+    // same Gamma(19.28, 1/1.61) statistical age model as wallet2. It is not a
+    // byte-for-byte implementation (see README's alignment note). The daemon
+    // client only supplies distribution and key data through `ProvidesDecoys`.
     stage(
         event_tx,
         format!("Selecting decoys ({} inputs)", selected.len()),
@@ -720,7 +744,15 @@ async fn send_inner(
     // payment of the (weight-identical) second.
     stage(event_tx, "Constructing transaction");
     let input_count = inputs.len();
-    let mut signable = build_signable(keys, inputs.clone(), recipient, amount, fee_rate, &mut rng)?;
+    let mut signable = build_signable(
+        keys,
+        inputs.clone(),
+        recipient,
+        amount,
+        fee_rate,
+        req.source,
+        &mut rng,
+    )?;
     let mut fee = signable.necessary_fee();
     if req.sweep_all {
         let total: u64 = selected.iter().map(|(_, o)| o.commitment().amount).sum();
@@ -730,7 +762,15 @@ async fn send_inner(
             }
             fee_estimate = fee;
             amount = sweep_payment(total, fee)?;
-            signable = build_signable(keys, inputs.clone(), recipient, amount, fee_rate, &mut rng)?;
+            signable = build_signable(
+                keys,
+                inputs.clone(),
+                recipient,
+                amount,
+                fee_rate,
+                req.source,
+                &mut rng,
+            )?;
             let refined = signable.necessary_fee();
             if refined == fee {
                 break;

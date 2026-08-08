@@ -452,11 +452,11 @@ mod tests {
     /// `scanner.rs` scans through a `monero-wallet` (monero-oxide) `ViewPair`
     /// built from the same keys. These are two independent implementations of
     /// Monero's address derivation, so agreeing is real evidence rather than
-    /// self-consistency — and disagreeing would be severe: the Receive tab
+    /// self-consistency — and disagreeing would be severe: the Addresses tab
     /// would hand out addresses whose incoming funds the scanner can never
     /// see, with no error anywhere.
     ///
-    /// Covers the primary address, the subaddresses the Receive tab offers
+    /// Covers the primary address, the subaddresses the Addresses tab offers
     /// (`0/1`..`0/4`), the edge of the scanner's registration window
     /// (`0/19`), and indices outside it, on all three networks.
     #[test]

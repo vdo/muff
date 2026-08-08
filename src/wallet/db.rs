@@ -46,6 +46,10 @@ const ARGON_P: u32 = 1;
 /// Existing shorter passwords remain unlockable for compatibility.
 pub const MIN_NEW_PASSWORD_CHARS: usize = 12;
 
+/// Primary address plus the initial four account-0 subaddresses. Additional
+/// rows are allocated explicitly and persisted in wallet metadata.
+pub const DEFAULT_RECEIVE_ADDRESS_COUNT: u32 = 5;
+
 /// How many recent block hashes are kept for reorg detection.
 const RECENT_HASH_WINDOW: u64 = 1024;
 
@@ -490,8 +494,9 @@ impl WalletDb {
         String::from_utf8(raw).context("corrupt network value in wallet db")
     }
 
-    /// First unused account-0 subaddress shown on the receive screen. Older
-    /// wallets did not persist allocation state, so they begin at 0/1.
+    /// First account-0 minor index not yet observed on-chain. This is kept
+    /// separately from the number of addresses the user has made visible:
+    /// several allocated addresses may all still be unused.
     pub fn next_receive_minor(&self) -> Result<u32> {
         Ok(self
             .meta_u64("next_receive_minor")?
@@ -505,6 +510,75 @@ impl WalletDb {
         if next > self.next_receive_minor()? {
             self.set_meta_u64("next_receive_minor", u64::from(next))?;
         }
+        Ok(())
+    }
+
+    /// Number of stable rows allocated on the Addresses screen, including
+    /// the primary address at row/minor 0. The default is compatible with
+    /// wallets created before this metadata existed.
+    pub fn receive_address_count(&self) -> Result<u32> {
+        Ok(self
+            .meta_u64("receive_address_count")?
+            .max(u64::from(DEFAULT_RECEIVE_ADDRESS_COUNT))
+            .min(u64::from(u32::MAX)) as u32)
+    }
+
+    /// Allocate one more account-0 subaddress and return its minor index.
+    pub fn allocate_receive_address(&self) -> Result<u32> {
+        let count = self.receive_address_count()?;
+        let next_count = count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("account-0 subaddress space is exhausted"))?;
+        self.set_meta_u64("receive_address_count", u64::from(next_count))?;
+        Ok(count)
+    }
+
+    /// Ensure an observed/restored subaddress remains visible. Returns true
+    /// only when metadata changed, allowing callers to avoid redundant saves.
+    pub fn ensure_receive_address_count(&self, count: u32) -> Result<bool> {
+        let current = self.receive_address_count()?;
+        if count > current {
+            self.set_meta_u64("receive_address_count", u64::from(count))?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Full subaddress index whose outputs the send engine may consume.
+    /// `selected_send_major` is absent in older wallets and therefore safely
+    /// defaults to account 0.
+    pub fn selected_send_subaddress(&self) -> Result<(u32, u32)> {
+        let major = self
+            .meta_u64("selected_send_major")?
+            .min(u64::from(u32::MAX)) as u32;
+        let mut minor = self
+            .meta_u64("selected_send_minor")?
+            .min(u64::from(u32::MAX)) as u32;
+        if major == 0 {
+            minor = minor.min(self.receive_address_count()?.saturating_sub(1));
+        }
+        Ok((major, minor))
+    }
+
+    pub fn set_selected_send_subaddress(&self, major: u32, minor: u32) -> Result<()> {
+        if major == 0 && minor >= self.receive_address_count()? {
+            bail!("send-source subaddress {minor} has not been allocated");
+        }
+        // Store the pair atomically: a concurrent periodic snapshot must not
+        // persist a major index from one selection and a minor from another.
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for (key, value) in [
+            ("selected_send_major", u64::from(major)),
+            ("selected_send_minor", u64::from(minor)),
+        ] {
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value.to_string().as_bytes()],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1634,6 +1708,39 @@ mod tests {
         drop(db);
         let reopened = WalletDb::open(&path, b"pw").unwrap();
         assert_eq!(reopened.next_receive_minor().unwrap(), 8);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn address_allocation_and_send_source_are_persistent() {
+        let path = temp_path("muff.wallet");
+        let db = WalletDb::create(&path, b"pw", &[14u8; 32], "mainnet", 0).unwrap();
+        assert_eq!(
+            db.receive_address_count().unwrap(),
+            DEFAULT_RECEIVE_ADDRESS_COUNT
+        );
+
+        let new_minor = db.allocate_receive_address().unwrap();
+        assert_eq!(new_minor, DEFAULT_RECEIVE_ADDRESS_COUNT);
+        assert_eq!(
+            db.receive_address_count().unwrap(),
+            DEFAULT_RECEIVE_ADDRESS_COUNT + 1
+        );
+        db.set_selected_send_subaddress(0, new_minor).unwrap();
+        assert_eq!(db.selected_send_subaddress().unwrap(), (0, new_minor));
+        assert!(
+            db.set_selected_send_subaddress(0, new_minor.saturating_add(1))
+                .is_err()
+        );
+
+        db.save().unwrap();
+        drop(db);
+        let reopened = WalletDb::open(&path, b"pw").unwrap();
+        assert_eq!(
+            reopened.receive_address_count().unwrap(),
+            DEFAULT_RECEIVE_ADDRESS_COUNT + 1
+        );
+        assert_eq!(reopened.selected_send_subaddress().unwrap(), (0, new_minor));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

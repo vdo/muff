@@ -1,0 +1,295 @@
+name: Release
+
+# Semver tags only, including pre-releases (v1.2.3, v1.2.3-rc.1).
+# A tag that does not match is ignored rather than published.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+# HARDENING: nothing is granted by default. Only the final `publish` job is
+# ever given write access, and only to the scopes it needs.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel a half-finished publish.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Pinned so a given tag always builds with the same compiler.
+  RUST_VERSION: "1.93.0"
+  BIN_NAME: muff
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. The tag must agree with the manifest before anything is built.
+  # ---------------------------------------------------------------------------
+  verify-tag:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Compare tag to manifest version
+        id: check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          manifest="$(python3 -c \
+            "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")"
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::tag $TAG implies version $version but Cargo.toml declares $manifest"
+            exit 1
+          fi
+          # A '-' after the patch number marks a semver pre-release.
+          case "$version" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $version (prerelease=$prerelease)"
+
+  # ---------------------------------------------------------------------------
+  # 2. Full CI must pass. Quality, tests on all four targets, and the
+  #    dependency audit all gate the release — no separate, weaker path.
+  # ---------------------------------------------------------------------------
+  ci:
+    name: CI
+    needs: verify-tag
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # ---------------------------------------------------------------------------
+  # 3. Build each artifact on its own native runner.
+  # ---------------------------------------------------------------------------
+  # Native runners rather than cross-compilation: no emulation, no toolchain
+  # shims, and the binary is produced by the same platform it targets.
+  #
+  # Windows is absent deliberately — the wallet file is written through
+  # `std::os::unix::fs` (owner-only 0600 permissions), so the crate does not
+  # build there. Adding Windows means first designing an equivalent ACL story.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [verify-tag, ci]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # ubuntu-22.04 rather than 24.04: the binary links the runner's
+          # glibc, so building on the older image keeps it usable on both.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            native: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            native: true
+          - target: aarch64-apple-darwin
+            os: macos-15
+            native: true
+          # Cross-compiled from Apple Silicon: GitHub retired the free Intel
+          # macOS runners (macos-13 removed, macos-14 deprecated), and
+          # macos-15-intel is a paid larger runner. The Apple SDK ships both
+          # slices, so this is a supported cross-compile — it just cannot be
+          # executed on the runner that produces it.
+          - target: x86_64-apple-darwin
+            os: macos-15
+            native: false
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustup target add "${{ matrix.target }}"
+
+      # HARDENING: released binaries are built from a cold cache on purpose.
+      # A restored cache is attacker-writable state from an earlier run; it
+      # must not be able to influence an artifact users will execute.
+      - name: Build
+        env:
+          # Full RELRO + immediate binding: the GOT is mapped read-only after
+          # startup, removing it as an overwrite target. Rust already emits
+          # PIE and a non-executable stack on these targets.
+          RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-Wl,-z,relro,-z,now' || '' }}
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Package
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="${BIN_NAME}-${VERSION}-${TARGET}"
+          mkdir -p "dist/${name}"
+          cp "target/${TARGET}/release/${BIN_NAME}" "dist/${name}/"
+          cp README.md "dist/${name}/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          # sha256sum on Linux, shasum on macOS.
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          else
+            shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          fi
+          cat "${name}.tar.gz.sha256"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      # Catches a binary that links but cannot start. Skipped for the
+      # cross-compiled slice, which this runner cannot execute.
+      - name: Smoke-test the binary
+        if: matrix.native
+        run: |
+          set -euo pipefail
+          "target/${{ matrix.target }}/release/${BIN_NAME}" --version
+
+      # The cross-compiled artifact gets the next best check: confirm it is
+      # actually a binary for the architecture claimed on the tin.
+      - name: Verify cross-compiled binary architecture
+        if: ${{ !matrix.native }}
+        run: |
+          set -euo pipefail
+          file "target/${{ matrix.target }}/release/${BIN_NAME}"
+          file "target/${{ matrix.target }}/release/${BIN_NAME}" | grep -q 'x86_64'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 4. Publish: checksums, provenance attestation, GitHub release.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish release
+    needs: [verify-tag, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      # The only write scopes in the whole pipeline.
+      contents: write # create the release and upload assets
+      id-token: write # OIDC identity for the provenance attestation
+      attestations: write # record the attestation
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Collect checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # One combined file so `sha256sum -c SHA256SUMS` verifies everything.
+          cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+          rm -f ./*.tar.gz.sha256
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      # Signed, verifiable statement of which workflow, at which commit,
+      # produced these exact bytes. Users can check a download with:
+      #   gh attestation verify muff-<ver>-<target>.tar.gz --repo vdo/muff
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      # Written to a file rather than piped, so the markdown is readable here
+      # and the shell quoting cannot swallow it.
+      - name: Compose release notes
+        env:
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<NOTES
+          ## Verifying this download
+
+          Checksums:
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS
+          \`\`\`
+
+          Build provenance — proves these exact bytes were produced by this
+          repository's release workflow at the tagged commit, not uploaded by
+          hand:
+
+          \`\`\`sh
+          gh attestation verify muff-${VERSION}-<target>.tar.gz --repo ${REPO}
+          \`\`\`
+
+          ## Downloads
+
+          | Platform | Artifact |
+          | --- | --- |
+          | Linux x86_64 | \`muff-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\` |
+          | Linux arm64 | \`muff-${VERSION}-aarch64-unknown-linux-gnu.tar.gz\` |
+          | macOS Intel | \`muff-${VERSION}-x86_64-apple-darwin.tar.gz\` |
+          | macOS Apple Silicon | \`muff-${VERSION}-aarch64-apple-darwin.tar.gz\` |
+
+          > **Experimental, unaudited software.** Use testnet/stagenet or small
+          > mainnet amounts only, and back up your seed phrase before use.
+          NOTES
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # --generate-notes appends the auto-generated changelog after ours.
+          # --verify-tag refuses to publish if the tag is not on the remote.
+          flags=(--title "$TAG" --notes-file release-notes.md
+                 --generate-notes --verify-tag)
+          if [ "$PRERELEASE" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" "${flags[@]}" \
+            dist/SHA256SUMS dist/*.tar.gz

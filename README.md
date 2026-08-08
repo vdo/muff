@@ -20,9 +20,9 @@ in a single encrypted wallet file.
 - Polyseed (16-word) and legacy 25-word mnemonic support
 - First-run wizard: create a new wallet or restore from seed
 - Tabs: **Dashboard** (balance, node status, recent activity, logs),
-  **Send** (fee priority tiers, sweep-all, address book), **Receive**
-  (addresses, QR code on demand), **History** (chronological transfers
-  with details), **Config** (password-gated seed/key reveal, change
+  **Send** (fee priority tiers, sweep-all, address book), **Addresses**
+  (per-address balances, send-source selection, QR codes), **History**
+  (chronological transfers with details), **Config** (password-gated seed/key reveal, change
   password, change daemon)
 - Outgoing transactions tracked through broadcast → mined → dropped states
 - Mouse support (clickable tabs, rows, buttons)
@@ -76,6 +76,25 @@ Example against a local stagenet node:
 - That said, again, this is young, AI-written code: prefer running it against
   your **own** node, on **stagenet/testnet**, or with **small mainnet amounts**
   you can afford to lose.
+
+### Monero `wallet2` privacy alignment
+
+Muff aims for statistical compatibility with the transaction policies in
+Monero `wallet2` v0.18.5.1. It follows the reference wallet's input
+relatedness and preferred-input rules, fee priorities, 16-member rings,
+Gamma-distributed decoy ages, transaction-wide ring sanity checks, persistent
+ring reuse, and subaddress lookahead. Exact signed transaction bytes are also
+retained when relay is uncertain so retrying cannot create an intersecting
+replacement ring.
+
+Decoy sampling and transaction signing remain delegated to
+`monero-wallet` 0.2.0. This provides the same statistical decoy model, but is
+not an exact reimplementation of `wallet2`: it requests candidates from the
+daemon differently, excludes the identity point as a decoy key, has no
+`wallet2` blackball database, and uses an independent Gamma sampler and CSPRNG.
+Consequently, privacy-policy alignment should not be read as a guarantee that
+Muff transactions or daemon traffic are perfectly indistinguishable from
+those produced by the reference wallet.
 
 ## Acknowledgements
 

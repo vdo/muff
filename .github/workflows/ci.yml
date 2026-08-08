@@ -1,0 +1,255 @@
+name: CI
+
+# Runs on every push and pull request, and is reused as a gate by the release
+# workflow (`workflow_call`) so nothing ships that has not passed these checks.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+# HARDENING: no permissions by default. Each job opts in to the minimum it
+# needs, so a compromised dependency, build script or action cannot push
+# commits, publish packages or mutate releases.
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Never cancel a run that a release is gating on.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Pinned: a toolchain release must not silently change what is compiled or
+  # which lints run. Bump deliberately, in its own commit.
+  RUST_VERSION: "1.93.0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Code quality
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Format, lints & docs
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # HARDENING: do not leave a usable GITHUB_TOKEN in .git/config for
+          # later steps (or anything they invoke) to pick up.
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal \
+            --component rustfmt,clippy
+          rustup default "$RUST_VERSION"
+          rustc --version && cargo --version
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: quality-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: quality-${{ runner.os }}-${{ env.RUST_VERSION }}-
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # `--locked` everywhere: the build must use the committed Cargo.lock and
+      # fail loudly rather than silently resolving to newer dependencies.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+
+  # ---------------------------------------------------------------------------
+  # Tests, on every architecture that ships a binary
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 rather than 24.04: binaries link against the runner's
+          # glibc, and building on the older image keeps them usable on it.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            native: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            native: true
+          - target: aarch64-apple-darwin
+            os: macos-15
+            native: true
+          # GitHub retired the free Intel macOS runners (macos-13 is gone,
+          # macos-14 deprecated; `macos-15-intel` is a paid larger runner), so
+          # this slice is cross-compiled from Apple Silicon and compile-checked
+          # rather than executed. Switch `os` to macos-15-intel and set
+          # native: true if you want the tests actually run there.
+          - target: x86_64-apple-darwin
+            os: macos-15
+            native: false
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustup target add "${{ matrix.target }}"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: test-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: test-${{ matrix.target }}-${{ env.RUST_VERSION }}-
+
+      # Tests that reach a live third-party Monero node are `#[ignore]`d, so
+      # this stays hermetic: no build depends on someone else's node being up,
+      # and CI activity is not leaked to that node's operator.
+      - name: Test
+        if: matrix.native
+        run: cargo test --locked --all-targets --all-features --target "${{ matrix.target }}"
+
+      # `--all-targets` skips doctests; run them separately so they cannot rot.
+      - name: Doctests
+        if: matrix.native
+        run: cargo test --locked --doc --all-features
+
+      # Cross-compiled slice: cannot be executed here, but it must still
+      # compile, so a break is caught now instead of at tag time.
+      - name: Compile check (cross-compiled target)
+        if: ${{ !matrix.native }}
+        run: cargo check --locked --all-targets --all-features --target "${{ matrix.target }}"
+
+  # ---------------------------------------------------------------------------
+  # Minimum supported Rust version
+  # ---------------------------------------------------------------------------
+  # `rust-version` in Cargo.toml is a promise to anyone building from source.
+  # Without a job that actually compiles on that toolchain it silently drifts,
+  # so this builds on exactly the declared floor. It is currently set by
+  # monero-wallet (1.89), not by this crate's own code.
+  msrv:
+    name: Build on declared MSRV
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          msrv="$(python3 -c \
+            "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['rust-version'])")"
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $msrv"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        run: |
+          rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
+          rustup default "${{ steps.msrv.outputs.version }}"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: msrv-${{ steps.msrv.outputs.version }}-
+
+      - name: Check
+        run: cargo check --locked --all-features --all-targets
+
+  # ---------------------------------------------------------------------------
+  # Dependency / supply-chain security
+  # ---------------------------------------------------------------------------
+  supply-chain:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Cache cargo-deny
+        id: cache-deny
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('deny.toml') }}
+
+      # Built from source rather than downloading a prebuilt binary: no
+      # unverified executable enters the pipeline, and no third-party action
+      # is trusted to fetch one.
+      - name: Install cargo-deny
+        if: steps.cache-deny.outputs.cache-hit != 'true'
+        run: cargo install cargo-deny --locked
+
+      # advisories - RustSec vulnerabilities and unmaintained/yanked crates
+      # bans       - duplicate and wildcard dependencies
+      # licenses   - every dependency license is on the allow-list
+      # sources    - crates come only from crates.io, no ad-hoc git deps
+      - name: cargo-deny
+        run: cargo deny --all-features check advisories bans licenses sources

@@ -46,6 +46,8 @@ pub fn render_send(frame: &mut Frame, area: Rect, state: &AppState, regions: &mu
             *fee,
             *inputs,
             state.send_fee_priority.label(),
+            &state.current_address_label(),
+            &state.current_change_address_label(),
             regions,
         ),
         SendStage::Publishing => render_status(
@@ -155,16 +157,16 @@ pub fn render_sweep_warning(frame: &mut Frame, area: Rect, state: &AppState) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Sweep-all spends every unlocked output in one transaction.",
+            "  Sweep-all spends every unlocked output from the selected address.",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  If those outputs came from different senders or subaddresses,"),
-        Line::from("  consolidating them can link those payment histories on-chain."),
+        Line::from("  If those outputs came from different senders or payments,"),
+        Line::from("  consolidating them can link those histories on-chain."),
         Line::from(""),
-        Line::from("  The recipient receives the entire unlocked balance minus fee."),
+        Line::from("  The recipient receives that address's unlocked balance minus fee."),
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -269,7 +271,7 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState, regions: &mut Re
         "  Amount [A]:    "
     };
 
-    let available = format_xmr(state.balance.unlocked);
+    let available = format_xmr(state.current_address_balance().unlocked);
 
     let form_lines = vec![
         Line::from(""),
@@ -301,6 +303,19 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState, regions: &mut Re
         Line::from(vec![
             Span::styled("  Available: ", Style::default().fg(Color::DarkGray)),
             Span::styled(available, Style::default().fg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::styled("  From:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                state.current_address_label(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  (change: {})", state.current_change_address_label()),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -455,11 +470,13 @@ fn render_confirm(
     fee: u64,
     inputs: usize,
     priority: &str,
+    source: &str,
+    change: &str,
     regions: &mut Regions,
 ) {
     // Register the [Y] / [N] buttons as click targets. They sit on the last
-    // content line (line index 11 inside the block border).
-    let button_y = area.y + 1 + 11;
+    // content line (line index 12 inside the block border).
+    let button_y = area.y + 1 + 12;
     if button_y < area.bottom().saturating_sub(1) {
         let inner_x = area.x + 1;
         let yes_width = 25u16.min(area.width.saturating_sub(2));
@@ -528,6 +545,14 @@ fn render_confirm(
             Span::styled(
                 format!("{} (ring size 16)", inputs),
                 Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  From:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(source, Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("  (change: {change})"),
+                Style::default().fg(Color::DarkGray),
             ),
         ]),
         Line::from(vec![

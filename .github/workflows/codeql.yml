@@ -1,0 +1,60 @@
+name: CodeQL
+
+# Static analysis, kept in its own workflow on purpose: it is the slowest
+# check and it depends on a GitHub-side feature, so it must not be able to
+# block the release path. Delete this file to drop it without touching CI.
+#
+# Free on public repositories. On a private repo this requires GitHub
+# Advanced Security.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly: new queries ship after code is merged, so a scan that only ran
+    # at merge time goes stale.
+    - cron: "27 4 * * 1"
+
+permissions: {}
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze Rust
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Required to upload findings to the Security tab.
+      security-events: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
+        with:
+          languages: rust
+          # security-extended adds lower-severity and precision-tuned queries
+          # beyond the default set.
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
+        with:
+          category: /language:rust

@@ -11,8 +11,9 @@ use crate::event::AppEvent;
 use crate::logbuf::LogBuffer;
 use crate::rpc::{DaemonClient, NodeStatus};
 use crate::wallet::{
-    BalanceInfo, MIN_NEW_PASSWORD_CHARS, OwnedOutput, ScanEvent, Scanner, SendEvent, SendPriority,
-    SendRequest, TransferDirection, TransferRecord, WalletDb, WalletKeys, format_xmr,
+    BalanceInfo, DEFAULT_RECEIVE_ADDRESS_COUNT, MIN_NEW_PASSWORD_CHARS, OwnedOutput, ScanEvent,
+    Scanner, SendEvent, SendPriority, SendRequest, TransferDirection, TransferRecord, WalletDb,
+    WalletKeys, format_xmr,
 };
 
 /// Which input field is focused on the send screen.
@@ -24,7 +25,7 @@ pub enum SendField {
     Book,
 }
 
-/// Number of tabs in the main UI (Dashboard, Send, Receive, History,
+/// Number of tabs in the main UI (Dashboard, Send, Addresses, History,
 /// Config). Node status is embedded in the dashboard.
 pub const TAB_COUNT: usize = 5;
 
@@ -142,12 +143,16 @@ pub enum MouseRegion {
     Tab(usize),
     /// One of the send-form input panes.
     SendField(SendField),
-    /// The "[Y] Sign & broadcast" button on the confirm screen.
+    /// The "`[Y]` Sign & broadcast" button on the confirm screen.
     ConfirmYes,
-    /// The "[N] Cancel" button on the confirm screen.
+    /// The "`[N]` Cancel" button on the confirm screen.
     ConfirmNo,
-    /// An address entry on the receive screen.
+    /// An address entry on the Addresses screen.
     ReceiveRow(usize),
+    /// Allocate another account-0 subaddress.
+    NewReceiveAddress,
+    /// Make the highlighted address the only source for future sends.
+    SelectReceiveSource,
     /// A transaction row (display order: 0 = newest) in the history table.
     HistoryRow(usize),
     /// An actionable option row on the config screen.
@@ -155,9 +160,6 @@ pub enum MouseRegion {
     /// An entry row in the send-screen address book.
     AddressBookRow(usize),
 }
-
-/// Number of addresses listed on the receive screen (primary + subaddresses).
-pub const RECEIVE_ADDRESS_COUNT: usize = 5;
 
 /// Copy text to the system clipboard, logging failures.
 pub fn copy_to_clipboard(text: &str) {
@@ -229,9 +231,12 @@ pub struct AppState {
     /// Whether the transaction detail modal is open on the history screen
     /// (toggled with Enter; follows `history_selected`).
     pub history_detail: bool,
-    /// Selected address index on the receive screen (0 = primary).
+    /// Highlighted row on the Addresses screen (0 = primary).
     pub receive_selected: usize,
-    /// Whether the full-address detail modal is open on the receive screen
+    /// Full subaddress index whose outputs may fund outgoing transactions.
+    pub send_from_major: u32,
+    pub send_from_minor: u32,
+    /// Whether the full-address detail modal is open on the Addresses screen
     /// (toggled with Enter).
     pub receive_detail: bool,
     /// Selected option row on the config screen.
@@ -252,13 +257,13 @@ pub struct AppState {
     pub send_field: SendField,
     pub send_address: String,
     pub send_amount: String,
-    /// Sweep-all armed by [M] (or an amount equal to the unlocked balance):
+    /// Sweep-all armed by `[M]` (or an amount equal to the unlocked balance):
     /// the fee is subtracted from the payment during construction.
     pub send_sweep: bool,
     /// Whether the privacy warning must be acknowledged before sweep-all is
     /// handed to the transaction engine.
     pub sweep_warning: bool,
-    /// Fee priority tier, cycled with [P] on the send screen.
+    /// Fee priority tier, cycled with `[P]` on the send screen.
     pub send_fee_priority: SendPriority,
     pub send_stage: SendStage,
     pub send_confirm_tx: Option<oneshot::Sender<bool>>,
@@ -313,6 +318,8 @@ impl AppState {
             history_selected: 0,
             history_detail: false,
             receive_selected: 0,
+            send_from_major: 0,
+            send_from_minor: 0,
             receive_detail: false,
             config_selected: 0,
             config_modal: ConfigModal::Hidden,
@@ -401,6 +408,30 @@ impl AppState {
                 })
             })
             .collect();
+        // Older wallets may already contain payments to subaddresses beyond
+        // the original five-row UI. Keep every observed account-0 address
+        // visible and persist the migration once.
+        let observed_count = self
+            .owned_outputs
+            .iter()
+            .filter(|output| output.subaddress_major == 0)
+            .map(|output| output.subaddress_minor.saturating_add(1))
+            .max()
+            .unwrap_or(DEFAULT_RECEIVE_ADDRESS_COUNT);
+        match db.ensure_receive_address_count(observed_count) {
+            Ok(true) => {
+                if let Err(e) = db.save() {
+                    tracing::warn!("failed to persist expanded address list: {e:#}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to read address allocation state: {e:#}"),
+        }
+        (self.send_from_major, self.send_from_minor) =
+            db.selected_send_subaddress().unwrap_or((0, 0));
+        self.receive_selected = self
+            .receive_selected
+            .min(self.receive_address_count().saturating_sub(1));
         self.transfers = history;
         // Keep the history selection in range after a reload.
         if self.transfers.is_empty() {
@@ -451,6 +482,10 @@ impl AppState {
             AppEvent::NodeStatus(status) => {
                 let was_disconnected = !self.node_status.connected;
                 self.node_status = status;
+                // Unlock-height transitions change both the selected-address
+                // and whole-wallet available balances even without a newly
+                // discovered output.
+                self.recalculate_balance();
                 // If the daemon just became reachable and the scanner isn't
                 // running yet, establish the RPC connection and start it.
                 if self.node_status.connected && !self.scanner_started && self.wallet_keys.is_some()
@@ -660,6 +695,19 @@ impl AppState {
     /// height as a fallback — an output is unlocked at its `unlock_height`
     /// (10-block standard lock; 60 blocks for miner outputs).
     fn recalculate_balance(&mut self) {
+        self.balance = self.balance_matching(|_| true);
+    }
+
+    fn balance_for_subaddress(&self, major: u32, minor: u32) -> BalanceInfo {
+        self.balance_matching(|output| {
+            output.subaddress_major == major && output.subaddress_minor == minor
+        })
+    }
+
+    /// Calculate total/unlocked/locked values over a chosen output scope.
+    /// Keeping this shared prevents the dashboard, Addresses tab, and send
+    /// validation from disagreeing about lock-height semantics.
+    fn balance_matching(&self, include: impl Fn(&OwnedOutput) -> bool) -> BalanceInfo {
         let mut total = 0u64;
         let mut unlocked = 0u64;
         let mut locked = 0u64;
@@ -676,7 +724,7 @@ impl AppState {
         );
 
         for output in &self.owned_outputs {
-            if output.spent {
+            if output.spent || !include(output) {
                 continue;
             }
             total += output.amount;
@@ -687,11 +735,11 @@ impl AppState {
             }
         }
 
-        self.balance = BalanceInfo {
+        BalanceInfo {
             total,
             unlocked,
             locked,
-        };
+        }
     }
 
     /// Whether a send is in a stage that must not be interrupted by locking
@@ -742,6 +790,9 @@ impl AppState {
         self.scan_progress = None;
         self.history_selected = 0;
         self.history_detail = false;
+        self.receive_selected = 0;
+        self.send_from_major = 0;
+        self.send_from_minor = 0;
         self.receive_detail = false;
         self.config_selected = 0;
         // SECURITY: drop any on-screen secrets / typed passwords.
@@ -959,7 +1010,7 @@ impl AppState {
         }
 
         // Tab-specific keys. Tab/BackTab move focus across the elements of
-        // the active screen (list selection on Receive/History/Config).
+        // the active screen (list selection on Addresses/History/Config).
         match self.active_tab {
             2 => self.handle_receive_keys(key),
             3 => self.handle_history_keys(key),
@@ -1087,11 +1138,12 @@ impl AppState {
                 KeyCode::Char('A') => self.send_field = SendField::Amount,
                 KeyCode::Char('B') => self.send_field = SendField::Book,
                 KeyCode::Char('M') => {
-                    // Fill the amount with the full unlocked balance and arm
-                    // sweep-all: the engine subtracts the fee from the
-                    // payment so the whole balance can be sent.
-                    if self.balance.unlocked > 0 {
-                        self.send_amount = format_xmr(self.balance.unlocked)
+                    // Sweep only the source selected on the Addresses tab.
+                    // The engine subtracts the fee from that address's
+                    // unlocked balance.
+                    let source_balance = self.current_address_balance();
+                    if source_balance.unlocked > 0 {
+                        self.send_amount = format_xmr(source_balance.unlocked)
                             .trim_end_matches(" XMR")
                             .to_string();
                         self.send_sweep = true;
@@ -1237,10 +1289,12 @@ impl AppState {
             self.send_stage = SendStage::Failed("Amount must be greater than zero".to_string());
             return;
         }
-        if self.balance.unlocked < amount {
+        let source_balance = self.current_address_balance();
+        if source_balance.unlocked < amount {
             self.send_stage = SendStage::Failed(format!(
-                "Insufficient unlocked balance ({})",
-                crate::wallet::format_xmr(self.balance.unlocked)
+                "Insufficient unlocked balance in {} ({})",
+                self.current_address_label(),
+                crate::wallet::format_xmr(source_balance.unlocked)
             ));
             return;
         }
@@ -1250,7 +1304,7 @@ impl AppState {
         // succeed with the fee on top, so the fee is subtracted from the
         // payment instead).
         let sweep_all =
-            self.send_sweep || (self.balance.unlocked > 0 && amount == self.balance.unlocked);
+            self.send_sweep || (source_balance.unlocked > 0 && amount == source_balance.unlocked);
         if sweep_all && !sweep_acknowledged {
             self.sweep_warning = true;
             return;
@@ -1267,6 +1321,7 @@ impl AppState {
             amount,
             sweep_all,
             priority: self.send_fee_priority.to_fee_priority(),
+            source: (self.send_from_major, self.send_from_minor),
         };
 
         tokio::spawn(async move {
@@ -1424,16 +1479,17 @@ impl AppState {
     }
 
     fn handle_receive_keys(&mut self, key: crossterm::event::KeyEvent) {
+        let count = self.receive_address_count();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
                 self.receive_selected = if self.receive_selected == 0 {
-                    RECEIVE_ADDRESS_COUNT - 1
+                    count.saturating_sub(1)
                 } else {
                     self.receive_selected - 1
                 };
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.receive_selected = (self.receive_selected + 1) % RECEIVE_ADDRESS_COUNT;
+                self.receive_selected = (self.receive_selected + 1) % count.max(1);
             }
             // Enter opens the detail modal with the full (untruncated)
             // address.
@@ -1448,7 +1504,64 @@ impl AppState {
                     copy_to_clipboard(&addr);
                 }
             }
+            KeyCode::Char('n') | KeyCode::Char('N') => self.allocate_receive_address(),
+            KeyCode::Char('s') | KeyCode::Char('S') => self.select_receive_source(),
             _ => {}
+        }
+    }
+
+    /// Persist one additional account-0 subaddress and highlight it. The
+    /// running scanner observes the allocation metadata before its next block
+    /// chunk, so an address is never displayed outside its scan frontier.
+    fn allocate_receive_address(&mut self) {
+        let Some(db) = self.wallet_db.clone() else {
+            self.last_error = Some("Wallet is locked".to_string());
+            return;
+        };
+        match db.allocate_receive_address().and_then(|minor| {
+            db.save()?;
+            Ok(minor)
+        }) {
+            Ok(minor) => {
+                self.receive_selected = minor as usize;
+                self.last_error = None;
+                tracing::info!("allocated subaddress 0/{minor}");
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed to create address: {e:#}"));
+            }
+        }
+    }
+
+    /// Restrict subsequent sends to the highlighted address. Persisting this
+    /// choice makes dashboard and send balances stable across restarts.
+    fn select_receive_source(&mut self) {
+        if self.send_in_flight() {
+            self.last_error = Some(
+                "Cannot change the send source while a transaction is in progress".to_string(),
+            );
+            return;
+        }
+        let Some(db) = self.wallet_db.clone() else {
+            self.last_error = Some("Wallet is locked".to_string());
+            return;
+        };
+        let (major, minor) = self.receive_subaddress_index(self.receive_selected);
+        match db
+            .set_selected_send_subaddress(major, minor)
+            .and_then(|()| db.save())
+        {
+            Ok(()) => {
+                self.send_from_major = major;
+                self.send_from_minor = minor;
+                self.send_sweep = false;
+                self.send_amount.clear();
+                self.last_error = None;
+                tracing::info!("outgoing source set to subaddress {major}/{minor}");
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed to select send address: {e:#}"));
+            }
         }
     }
 
@@ -1978,7 +2091,18 @@ impl AppState {
                     }
                     Some(MouseRegion::ReceiveRow(i)) => {
                         if self.active_tab == 2 {
-                            self.receive_selected = i.min(RECEIVE_ADDRESS_COUNT - 1);
+                            self.receive_selected =
+                                i.min(self.receive_address_count().saturating_sub(1));
+                        }
+                    }
+                    Some(MouseRegion::NewReceiveAddress) => {
+                        if self.active_tab == 2 {
+                            self.allocate_receive_address();
+                        }
+                    }
+                    Some(MouseRegion::SelectReceiveSource) => {
+                        if self.active_tab == 2 {
+                            self.select_receive_source();
                         }
                     }
                     Some(MouseRegion::HistoryRow(i)) => {
@@ -2006,8 +2130,9 @@ impl AppState {
             }
             MouseEventKind::ScrollUp => match self.active_tab {
                 2 => {
+                    let count = self.receive_address_count();
                     self.receive_selected = if self.receive_selected == 0 {
-                        RECEIVE_ADDRESS_COUNT - 1
+                        count.saturating_sub(1)
                     } else {
                         self.receive_selected - 1
                     };
@@ -2019,7 +2144,8 @@ impl AppState {
             },
             MouseEventKind::ScrollDown => match self.active_tab {
                 2 => {
-                    self.receive_selected = (self.receive_selected + 1) % RECEIVE_ADDRESS_COUNT;
+                    self.receive_selected =
+                        (self.receive_selected + 1) % self.receive_address_count().max(1);
                 }
                 3 if !self.transfers.is_empty() => {
                     self.history_selected =
@@ -2091,40 +2217,108 @@ impl AppState {
         }
     }
 
-    /// Actual minor index represented by a receive-screen row. Rows after the
-    /// primary address start at the first subaddress not yet observed by the
-    /// scanner, rather than cycling through a fixed reusable set.
-    pub fn receive_subaddress_minor(&self, index: usize) -> u32 {
-        if index == 0 {
-            return 0;
-        }
-        let first_unused = self
-            .wallet_db
+    fn allocated_receive_address_count(&self) -> usize {
+        self.wallet_db
             .as_ref()
-            .and_then(|db| db.next_receive_minor().ok())
-            .unwrap_or(1);
-        first_unused.saturating_add(index.saturating_sub(1) as u32)
+            .and_then(|db| db.receive_address_count().ok())
+            .unwrap_or(DEFAULT_RECEIVE_ADDRESS_COUNT) as usize
+    }
+
+    /// Stable allocated account-0 rows followed by any addresses discovered
+    /// in restored nonzero accounts. Without the latter, selecting a strict
+    /// send source could make those already-detected funds unreachable.
+    pub fn receive_address_indices(&self) -> Vec<(u32, u32)> {
+        let allocated = self.allocated_receive_address_count();
+        let mut indices: Vec<(u32, u32)> = (0..allocated)
+            .map(|minor| (0, u32::try_from(minor).unwrap_or(u32::MAX)))
+            .collect();
+        let mut observed: std::collections::BTreeSet<(u32, u32)> = self
+            .owned_outputs
+            .iter()
+            .map(|output| (output.subaddress_major, output.subaddress_minor))
+            .filter(|(major, minor)| *major != 0 || (*minor as usize) >= allocated)
+            .collect();
+        if self.send_from_major != 0 {
+            // Keep a persisted nonzero-account source selectable even if a
+            // reorg removed its last observed output from the local database.
+            observed.insert((self.send_from_major, self.send_from_minor));
+        }
+        indices.extend(observed);
+        indices
+    }
+
+    pub fn receive_address_count(&self) -> usize {
+        self.receive_address_indices().len()
+    }
+
+    /// Actual subaddress index represented by an Addresses-screen row.
+    pub fn receive_subaddress_index(&self, index: usize) -> (u32, u32) {
+        self.receive_address_indices()
+            .get(index)
+            .copied()
+            .unwrap_or((0, 0))
+    }
+
+    pub fn receive_subaddress_minor(&self, index: usize) -> u32 {
+        self.receive_subaddress_index(index).1
     }
 
     pub fn receive_address_label(&self, index: usize) -> String {
-        if index == 0 {
-            "Primary".to_string()
-        } else {
-            format!("Sub #{}", self.receive_subaddress_minor(index))
+        let (major, minor) = self.receive_subaddress_index(index);
+        match (major, minor) {
+            (0, 0) => "Primary".to_string(),
+            (0, minor) => format!("Sub #{minor}"),
+            _ => format!("Acct {major}/{minor}"),
         }
     }
 
-    /// The address string for a receive-screen selection index.
+    /// The address string for an Addresses-screen selection index.
     pub fn receive_address_string(&self, index: usize) -> Option<String> {
+        if index >= self.receive_address_count() {
+            return None;
+        }
+        let (major, minor) = self.receive_subaddress_index(index);
+        self.subaddress_string(major, minor)
+    }
+
+    fn subaddress_string(&self, major: u32, minor: u32) -> Option<String> {
         let keys = self.wallet_keys.as_ref()?;
-        if index == 0 {
+        if (major, minor) == (0, 0) {
             return Some(keys.address_string());
         }
-        let sub = monero::cryptonote::subaddress::Index {
-            major: 0,
-            minor: self.receive_subaddress_minor(index),
-        };
+        let sub = monero::cryptonote::subaddress::Index { major, minor };
         Some(keys.get_subaddress(sub).to_string())
+    }
+
+    /// Unspent balance belonging to one account-0 address. Pending outgoing
+    /// inputs are already marked spent, so they cannot be counted twice.
+    pub fn receive_address_balance(&self, index: usize) -> BalanceInfo {
+        let (major, minor) = self.receive_subaddress_index(index);
+        self.balance_for_subaddress(major, minor)
+    }
+
+    pub fn current_address_label(&self) -> String {
+        match (self.send_from_major, self.send_from_minor) {
+            (0, 0) => "Primary".to_string(),
+            (0, minor) => format!("Sub #{minor}"),
+            (major, minor) => format!("Acct {major}/{minor}"),
+        }
+    }
+
+    pub fn current_address_string(&self) -> Option<String> {
+        self.subaddress_string(self.send_from_major, self.send_from_minor)
+    }
+
+    pub fn current_change_address_label(&self) -> String {
+        if self.send_from_major == 0 {
+            "Primary".to_string()
+        } else {
+            format!("Acct {}/0", self.send_from_major)
+        }
+    }
+
+    pub fn current_address_balance(&self) -> BalanceInfo {
+        self.balance_for_subaddress(self.send_from_major, self.send_from_minor)
     }
 
     /// Refresh node status asynchronously.
@@ -2166,9 +2360,9 @@ impl AppState {
 
         tokio::spawn(async move {
             let result = (|| -> color_eyre::Result<(monero_wallet::Scanner, _)> {
-                let next_receive_minor = db.next_receive_minor()?;
-                let wallet_scanner =
-                    crate::wallet::build_wallet_scanner_with_cursor(&keys, next_receive_minor)?;
+                // The running Scanner expands this baseline from the
+                // database before it consumes any block.
+                let wallet_scanner = crate::wallet::build_wallet_scanner(&keys)?;
                 let spend = crate::wallet::send::spend_scalar(&keys.keypair.spend)?;
                 Ok((wallet_scanner, spend))
             })();

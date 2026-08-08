@@ -170,7 +170,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
 
     // Centered box: 60% wide, fixed height (sized to the content below).
     let width = (area.width * 60 / 100).clamp(56, 78).min(area.width);
-    let height = 42u16.min(area.height);
+    let height = 44u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -216,7 +216,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("    Esc               back to dashboard"),
         Line::from(""),
         Line::from(Span::styled(
-            "  Receive",
+            "  Addresses",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -224,6 +224,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("    j/k, Up/Down, Tab select address"),
         Line::from("    Enter             show QR code & full address (again to close)"),
         Line::from("    [C]               copy selected address"),
+        Line::from("    [N]               create another subaddress"),
+        Line::from("    [S]               use selected address as send source"),
         Line::from(""),
         Line::from(Span::styled(
             "  History",

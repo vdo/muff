@@ -23,6 +23,7 @@ fn make_config(url: &str) -> muff::config::Config {
 }
 
 #[tokio::test]
+#[ignore = "hits a live third-party Monero node; run explicitly with `cargo test -- --ignored`"]
 async fn test_connect_and_fetch_block() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("muff=debug,info")
@@ -54,6 +55,7 @@ async fn test_connect_and_fetch_block() {
 }
 
 #[tokio::test]
+#[ignore = "hits a live third-party Monero node; run explicitly with `cargo test -- --ignored`"]
 async fn test_scanner_pipeline() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("muff=debug,info")
@@ -165,6 +167,7 @@ async fn test_scanner_pipeline() {
 }
 
 #[tokio::test]
+#[ignore = "hits a live third-party Monero node; run explicitly with `cargo test -- --ignored`"]
 async fn test_block_hash_endpoints() {
     let config = make_config("http://xmr-node.cakewallet.com:18081");
     let daemon = muff::rpc::DaemonClient::new(&config);

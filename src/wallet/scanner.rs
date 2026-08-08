@@ -85,6 +85,10 @@ pub struct Scanner {
     cancel: Arc<AtomicBool>,
     /// Last time key-image spentness was checked (throttled).
     last_ki_check: Option<std::time::Instant>,
+    /// Exclusive registered minor-index end for each registered account.
+    /// Tracking the frontier avoids re-deriving the full 50×200 lookahead
+    /// every time an output is found or the user allocates another address.
+    registered_minor_ends: Vec<u32>,
 }
 
 impl Drop for Scanner {
@@ -110,11 +114,62 @@ impl Scanner {
             db,
             cancel,
             last_ki_check: None,
+            // `build_wallet_scanner` guarantees this baseline. Any extended
+            // builder registrations may be repeated once, which is harmless;
+            // assuming they exist would risk permanently skipping indices
+            // when a caller supplied only the baseline scanner.
+            registered_minor_ends: vec![200; 50],
         }
     }
 
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Extend the scanner to wallet2's 50-account/200-minor lookahead beyond
+    /// an address frontier. Only newly exposed indices are derived.
+    fn ensure_subaddress_lookahead(&mut self, major: u32, minor: u32) -> Result<()> {
+        use monero_wallet::address::SubaddressIndex;
+
+        let desired_major_end = usize::try_from(major.saturating_add(50))
+            .map_err(|_| color_eyre::eyre::eyre!("subaddress account index is too large"))?;
+        while self.registered_minor_ends.len() < desired_major_end {
+            let new_major = u32::try_from(self.registered_minor_ends.len())
+                .map_err(|_| color_eyre::eyre::eyre!("subaddress account index is too large"))?;
+            for new_minor in 0..200u32 {
+                if let Some(index) = SubaddressIndex::new(new_major, new_minor) {
+                    self.wallet_scanner.register_subaddress(index);
+                }
+            }
+            self.registered_minor_ends.push(200);
+        }
+
+        let major_index = usize::try_from(major)
+            .map_err(|_| color_eyre::eyre::eyre!("subaddress account index is too large"))?;
+        let desired_minor_end = minor.saturating_add(200);
+        let current_end = self.registered_minor_ends[major_index];
+        for new_minor in current_end..desired_minor_end {
+            if major == 0 && new_minor == 0 {
+                continue;
+            }
+            if let Some(index) = SubaddressIndex::new(major, new_minor) {
+                self.wallet_scanner.register_subaddress(index);
+            }
+        }
+        self.registered_minor_ends[major_index] = current_end.max(desired_minor_end);
+        Ok(())
+    }
+
+    /// Pick up addresses allocated by the UI while this background scanner
+    /// is already running. This closes the gap between a dynamic address list
+    /// and the scanner instance created when the wallet was unlocked.
+    fn sync_allocated_address_lookahead(&mut self) -> Result<()> {
+        let frontier = self
+            .db
+            .next_receive_minor()?
+            .max(self.db.receive_address_count()?)
+            .saturating_sub(1);
+        self.ensure_subaddress_lookahead(0, frontier)
     }
 
     /// Run the scanner in the background, scanning from `start_height` to the
@@ -193,6 +248,7 @@ impl Scanner {
             if self.cancelled() {
                 return Ok(());
             }
+            self.sync_allocated_address_lookahead()?;
             let tip = self.daemon.get_height().await?.saturating_sub(1);
             if current > tip {
                 // Caught up: report, refresh spentness (throttled), persist,
@@ -351,6 +407,10 @@ impl Scanner {
                 if resp.blocks.is_empty() {
                     break;
                 }
+
+                // Address allocation can happen while a long historical scan
+                // is in flight; refresh before consuming each returned chunk.
+                self.sync_allocated_address_lookahead()?;
 
                 for entry in resp.blocks {
                     match self.process_block(entry, current, &mut rct_index).await? {
@@ -771,29 +831,9 @@ impl Scanner {
             .map(|i| (i.account(), i.address()))
             .unwrap_or((0, 0));
 
-        // wallet2 expands its scanning map when a lookahead address is
-        // observed. Keep 50 further accounts and 200 minor slots reachable;
-        // otherwise the receive cursor could eventually display an address
-        // this long-running scanner never registered.
-        let major_end = major.saturating_add(50);
-        for lookahead_major in 0..major_end {
-            let minor_end = if lookahead_major == major {
-                minor.saturating_add(200)
-            } else {
-                200
-            };
-            for lookahead_minor in 0..minor_end {
-                if lookahead_major == 0 && lookahead_minor == 0 {
-                    continue;
-                }
-                if let Some(index) = monero_wallet::address::SubaddressIndex::new(
-                    lookahead_major,
-                    lookahead_minor,
-                ) {
-                    self.wallet_scanner.register_subaddress(index);
-                }
-            }
-        }
+        // A hit at the edge moves the lookahead frontier just as wallet2's
+        // expandable subaddress map does.
+        self.ensure_subaddress_lookahead(major, minor)?;
 
         let stored = StoredOutput {
             wallet_output_hex: hex::encode(output.serialize()),
@@ -826,6 +866,8 @@ impl Scanner {
             // gives the UI fresh addresses while the fixed lookahead below
             // preserves restore compatibility with wallet2.
             self.db.advance_receive_minor(minor.saturating_add(1))?;
+            self.db
+                .ensure_receive_address_count(minor.saturating_add(1))?;
         }
         if !inserted {
             return Ok(());
@@ -1180,7 +1222,10 @@ pub fn build_wallet_scanner_with_cursor(
     // received on an address beyond the small set currently shown by the UI.
     for major in 0..50u32 {
         let minor_end = if major == 0 {
-            next_receive_minor.saturating_sub(1).saturating_add(200).max(200)
+            next_receive_minor
+                .saturating_sub(1)
+                .saturating_add(200)
+                .max(200)
         } else {
             200
         };

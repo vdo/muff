@@ -9,7 +9,8 @@ pub mod state;
 
 pub use balance::{BalanceInfo, OwnedOutput, TransferDirection, TransferRecord};
 pub use db::{
-    AddressBookEntry, MIN_NEW_PASSWORD_CHARS, SeedFormat, WalletDb, WalletFileFormat, detect_format,
+    AddressBookEntry, DEFAULT_RECEIVE_ADDRESS_COUNT, MIN_NEW_PASSWORD_CHARS, SeedFormat, WalletDb,
+    WalletFileFormat, detect_format,
 };
 pub use keys::{WalletKeys, derive_keys, format_xmr, generate_seed, sc_reduce32};
 pub use mnemonic::{
