@@ -29,7 +29,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 monero = { version = "0.22", features = ["serde"] }
 monero-rpc = "0.5"
 monero-wallet = "0.2"
-curve25519-dalek = "4"
+curve25519-dalek = "5"
 
 # Async
 tokio = { version = "1", features = ["full"] }
