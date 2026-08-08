@@ -19,8 +19,8 @@ use monero_wallet::transaction::{Pruned, Transaction};
 use monero_wallet::{Scanner as WalletScanner, WalletOutput};
 
 use crate::event::AppEvent;
-use crate::rpc::DaemonClient;
 use crate::rpc::bin::BlockEntry;
+use crate::rpc::{DaemonClient, PublishError};
 use crate::wallet::balance::OwnedOutput;
 use crate::wallet::db::WalletDb;
 use crate::wallet::state::StoredOutput;
@@ -43,7 +43,9 @@ pub enum ScanEvent {
     TransferConfirmed { tx_hash: String, height: u64 },
     /// An outgoing transfer was dropped from the tx pool without being
     /// mined; its inputs are spendable again.
-    TransferFailed { tx_hash: String },
+    TransferFailed { tx_hash: String, reason: String },
+    /// A previously uncertain exact-byte relay has now succeeded.
+    TransferRelayed { tx_hash: String },
     /// A chain reorganization was handled; the wallet rolled back to the
     /// fork height and is rescanning the new chain.
     Reorg { fork_height: u64 },
@@ -202,6 +204,11 @@ impl Scanner {
                 let check_due = self
                     .last_ki_check
                     .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(600));
+                // Retry only the previously persisted signed bytes. This must
+                // run before spentness refresh so an uncertain first relay is
+                // never mistaken for a dropped transaction and rebuilt.
+                self.retry_unrelayed_transactions().await;
+
                 if check_due {
                     self.refresh_spent_status().await;
                     self.last_ki_check = Some(std::time::Instant::now());
@@ -764,6 +771,30 @@ impl Scanner {
             .map(|i| (i.account(), i.address()))
             .unwrap_or((0, 0));
 
+        // wallet2 expands its scanning map when a lookahead address is
+        // observed. Keep 50 further accounts and 200 minor slots reachable;
+        // otherwise the receive cursor could eventually display an address
+        // this long-running scanner never registered.
+        let major_end = major.saturating_add(50);
+        for lookahead_major in 0..major_end {
+            let minor_end = if lookahead_major == major {
+                minor.saturating_add(200)
+            } else {
+                200
+            };
+            for lookahead_minor in 0..minor_end {
+                if lookahead_major == 0 && lookahead_minor == 0 {
+                    continue;
+                }
+                if let Some(index) = monero_wallet::address::SubaddressIndex::new(
+                    lookahead_major,
+                    lookahead_minor,
+                ) {
+                    self.wallet_scanner.register_subaddress(index);
+                }
+            }
+        }
+
         let stored = StoredOutput {
             wallet_output_hex: hex::encode(output.serialize()),
             key_hex: key_hex.clone(),
@@ -782,14 +813,22 @@ impl Scanner {
         // Burning-bug / replay dedup: never track the same output key twice.
         // (Pending outgoing transfers are confirmed by tx-hash matching in
         // `process_block`, which also covers zero-change transactions.)
-        match self.db.insert_received_output(&stored, &tx_hash, &note) {
-            Ok(true) => {}
-            Ok(false) => return Ok(()),
+        let inserted = match self.db.insert_received_output(&stored, &tx_hash, &note) {
+            Ok(inserted) => inserted,
             Err(e) => {
                 return Err(color_eyre::eyre::eyre!(
                     "record wallet output {key_hex}: {e}"
                 ));
             }
+        };
+        if major == 0 && minor > 0 {
+            // Keep the receive cursor beyond every observed subaddress. This
+            // gives the UI fresh addresses while the fixed lookahead below
+            // preserves restore compatibility with wallet2.
+            self.db.advance_receive_minor(minor.saturating_add(1))?;
+        }
+        if !inserted {
+            return Ok(());
         }
 
         let _ = self
@@ -863,6 +902,99 @@ impl Scanner {
         }
         if changed && let Err(e) = self.db.save() {
             tracing::warn!("failed to save after pool reconciliation: {e}");
+        }
+    }
+
+    /// Retry signed transactions whose first relay result was uncertain.
+    /// Reusing the byte-for-byte transaction is the ring-intersection safety
+    /// boundary: this method must never invoke transaction construction.
+    async fn retry_unrelayed_transactions(&mut self) {
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs().saturating_sub(30))
+            .unwrap_or(0);
+        let pending = match self.db.unrelayed_transactions(cutoff) {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!("failed to load transactions awaiting relay: {e}");
+                return;
+            }
+        };
+        let mut changed = false;
+        for (tx_hash, tx_blob) in pending {
+            match self.daemon.publish_transaction(&tx_blob).await {
+                Ok(_) => match self.db.mark_transaction_relayed(&tx_hash) {
+                    Ok(()) => {
+                        changed = true;
+                        tracing::info!("relayed saved transaction {tx_hash}");
+                        let _ = self
+                            .event_tx
+                            .send(AppEvent::Scan(ScanEvent::TransferRelayed {
+                                tx_hash: tx_hash.clone(),
+                            }));
+                    }
+                    Err(e) => tracing::warn!("failed to mark {tx_hash} relayed: {e}"),
+                },
+                Err(PublishError::Rejected(reason)) => {
+                    match self.db.reject_signed_transfer(&tx_hash) {
+                        Ok(()) => {
+                            changed = true;
+                            tracing::warn!("saved transaction {tx_hash} was rejected: {reason}");
+                            let _ = self
+                                .event_tx
+                                .send(AppEvent::Scan(ScanEvent::TransferFailed {
+                                    tx_hash,
+                                    reason: format!("was rejected by the daemon: {reason}"),
+                                }));
+                        }
+                        Err(e) => tracing::warn!("failed to release rejected {tx_hash}: {e}"),
+                    }
+                }
+                Err(PublishError::Ambiguous(reason)) => {
+                    // A duplicate submission commonly has an ambiguous
+                    // response. Resolve it by key image before leaving the
+                    // exact blob queued for the next pass.
+                    let reserved = match self.db.outputs_reserved_by(&tx_hash) {
+                        Ok(outputs) => outputs,
+                        Err(e) => {
+                            tracing::warn!("failed to load inputs for {tx_hash}: {e}");
+                            continue;
+                        }
+                    };
+                    let images: Vec<String> = reserved
+                        .iter()
+                        .filter_map(|output| {
+                            crate::wallet::send::key_image_for_stored(output, &self.spend_scalar)
+                        })
+                        .collect();
+                    let relayed = !images.is_empty()
+                        && images.len() == reserved.len()
+                        && matches!(
+                            self.daemon.is_key_images_spent(&images).await,
+                            Ok(statuses) if statuses.len() == images.len()
+                                && statuses.iter().all(|status| *status != 0)
+                        );
+                    if relayed {
+                        if let Err(e) = self.db.mark_transaction_relayed(&tx_hash) {
+                            tracing::warn!("failed to mark {tx_hash} relayed: {e}");
+                        } else {
+                            changed = true;
+                            let _ =
+                                self.event_tx
+                                    .send(AppEvent::Scan(ScanEvent::TransferRelayed {
+                                        tx_hash: tx_hash.clone(),
+                                    }));
+                        }
+                    } else {
+                        tracing::debug!(
+                            "saved transaction {tx_hash} still has an uncertain relay result: {reason}"
+                        );
+                    }
+                }
+            }
+        }
+        if changed && let Err(e) = self.db.save() {
+            tracing::warn!("failed to save transaction relay updates: {e}");
         }
     }
 
@@ -946,6 +1078,13 @@ impl Scanner {
                 }
                 // Daemon says unspent.
                 if output.spent {
+                    if output.spent_tx.as_deref().is_some_and(|tx_hash| {
+                        // Fail closed on a database error: releasing an input
+                        // whose first relay is uncertain is the unsafe choice.
+                        self.db.transaction_awaiting_relay(tx_hash).unwrap_or(true)
+                    }) {
+                        continue;
+                    }
                     match self.db.release_output(&output.key_hex) {
                         Ok(released) => {
                             unspent_events.push(output.key_hex.clone());
@@ -983,7 +1122,10 @@ impl Scanner {
                 );
                 let _ = self
                     .event_tx
-                    .send(AppEvent::Scan(ScanEvent::TransferFailed { tx_hash }));
+                    .send(AppEvent::Scan(ScanEvent::TransferFailed {
+                        tx_hash,
+                        reason: "was dropped by the network".to_string(),
+                    }));
             }
         }
     }
@@ -1016,17 +1158,39 @@ pub fn build_view_pair(keys: &crate::wallet::WalletKeys) -> Result<monero_wallet
         .map_err(|e| color_eyre::eyre::eyre!("failed to build view pair: {e}"))
 }
 
-/// Convert the wallet's keys into a `monero-wallet` scanner with the primary
-/// address and the first 20 subaddresses registered.
+/// Convert the wallet's keys into a `monero-wallet` scanner using wallet2's
+/// default 50-account by 200-address lookahead window.
 pub fn build_wallet_scanner(keys: &crate::wallet::WalletKeys) -> Result<WalletScanner> {
+    build_wallet_scanner_with_cursor(keys, 1)
+}
+
+/// Build the reference lookahead while extending account 0 past the wallet's
+/// highest observed receive address. `next_receive_minor` is the first unused
+/// minor index persisted by `WalletDb`.
+pub fn build_wallet_scanner_with_cursor(
+    keys: &crate::wallet::WalletKeys,
+    next_receive_minor: u32,
+) -> Result<WalletScanner> {
     use monero_wallet::address::SubaddressIndex;
 
     let pair = build_view_pair(keys)?;
     let mut scanner = WalletScanner::new(pair);
-    // Primary address is implicit; register the first 20 subaddresses.
-    for minor in 1..20u32 {
-        if let Some(index) = SubaddressIndex::new(0, minor) {
-            scanner.register_subaddress(index);
+    // Primary 0/0 is implicit. Keeping the reference lookahead is important
+    // for restore behavior: funds must not disappear merely because they were
+    // received on an address beyond the small set currently shown by the UI.
+    for major in 0..50u32 {
+        let minor_end = if major == 0 {
+            next_receive_minor.saturating_sub(1).saturating_add(200).max(200)
+        } else {
+            200
+        };
+        for minor in 0..minor_end {
+            if major == 0 && minor == 0 {
+                continue;
+            }
+            if let Some(index) = SubaddressIndex::new(major, minor) {
+                scanner.register_subaddress(index);
+            }
         }
     }
     Ok(scanner)

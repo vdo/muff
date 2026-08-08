@@ -20,6 +20,8 @@ pub use polyseed::{
     PolyseedError, birthday_to_height, generate_polyseed, is_valid_bip39_word,
     polyseed_autocomplete, polyseed_to_key,
 };
-pub use scanner::{ScanEvent, Scanner, build_view_pair, build_wallet_scanner};
+pub use scanner::{
+    ScanEvent, Scanner, build_view_pair, build_wallet_scanner, build_wallet_scanner_with_cursor,
+};
 pub use send::{SendEvent, SendPriority, SendRequest};
 pub use state::StoredOutput;

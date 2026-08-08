@@ -7,15 +7,6 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use crate::app::{AppState, MouseRegion, RECEIVE_ADDRESS_COUNT};
 use crate::ui::{Regions, centered_rect, truncate_middle};
 
-/// Label for a receive-list index (0 = primary address).
-fn address_label(index: usize) -> String {
-    if index == 0 {
-        "Primary".to_string()
-    } else {
-        format!("Sub #{index}")
-    }
-}
-
 /// Render the receive screen showing wallet addresses.
 ///
 /// The screen is a single full-width address list; the QR code is only
@@ -71,14 +62,14 @@ fn render_addresses(frame: &mut Frame, area: Rect, state: &AppState, regions: &m
         };
         lines.push(Line::from(vec![
             Span::styled(marker, style),
-            Span::styled(format!("{:<8}", address_label(i)), style),
+            Span::styled(format!("{:<8}", state.receive_address_label(i)), style),
             Span::styled(truncate_middle(&addr, addr_budget), style),
         ]));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Use a fresh subaddress per sender for privacy.",
+        "  Use a fresh subaddress for each anticipated payment.",
         Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(Span::styled(
@@ -141,7 +132,7 @@ fn qr_lines(data: &[u8]) -> Option<(Vec<Line<'static>>, usize)> {
 /// (opened with Enter). The QR is only rendered here, on demand — never
 /// on the receive screen itself.
 pub fn render_detail_modal(frame: &mut Frame, area: Rect, state: &AppState) {
-    let label = address_label(state.receive_selected);
+    let label = state.receive_address_label(state.receive_selected);
     let Some(address) = state.receive_address_string(state.receive_selected) else {
         return;
     };

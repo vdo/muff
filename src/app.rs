@@ -193,6 +193,8 @@ pub enum SendStage {
     Publishing,
     /// Transaction published successfully.
     Done { tx_hash: String, fee: u64 },
+    /// Relay result was uncertain; the exact transaction is queued locally.
+    StoredForRetry { tx_hash: String, fee: u64 },
     /// Sending failed (or was cancelled).
     Failed(String),
 }
@@ -253,6 +255,9 @@ pub struct AppState {
     /// Sweep-all armed by [M] (or an amount equal to the unlocked balance):
     /// the fee is subtracted from the payment during construction.
     pub send_sweep: bool,
+    /// Whether the privacy warning must be acknowledged before sweep-all is
+    /// handed to the transaction engine.
+    pub sweep_warning: bool,
     /// Fee priority tier, cycled with [P] on the send screen.
     pub send_fee_priority: SendPriority,
     pub send_stage: SendStage,
@@ -319,6 +324,7 @@ impl AppState {
             send_address: String::new(),
             send_amount: String::new(),
             send_sweep: false,
+            sweep_warning: false,
             send_fee_priority: SendPriority::default(),
             send_stage: SendStage::Entering,
             send_confirm_tx: None,
@@ -530,7 +536,7 @@ impl AppState {
                         self.recalculate_balance();
                     }
                 }
-                ScanEvent::TransferFailed { tx_hash } => {
+                ScanEvent::TransferFailed { tx_hash, reason } => {
                     for record in self.transfers.iter_mut() {
                         if record.tx_hash == tx_hash {
                             record.failed = true;
@@ -538,9 +544,33 @@ impl AppState {
                         }
                     }
                     self.last_error = Some(format!(
-                        "Transaction {}… was dropped by the network; funds unlocked",
-                        &tx_hash[..8.min(tx_hash.len())]
+                        "Transaction {}… {reason}; funds unlocked",
+                        &tx_hash[..8.min(tx_hash.len())],
                     ));
+                    if matches!(
+                        &self.send_stage,
+                        SendStage::StoredForRetry { tx_hash: pending, .. } if *pending == tx_hash
+                    ) {
+                        self.send_stage = SendStage::Failed(format!(
+                            "Transaction {}… {reason}; funds unlocked",
+                            &tx_hash[..8.min(tx_hash.len())]
+                        ));
+                    }
+                    self.load_persisted_state();
+                }
+                ScanEvent::TransferRelayed { tx_hash } => {
+                    if let SendStage::StoredForRetry {
+                        tx_hash: pending,
+                        fee,
+                    } = &self.send_stage
+                        && *pending == tx_hash
+                    {
+                        self.send_stage = SendStage::Done {
+                            tx_hash: tx_hash.clone(),
+                            fee: *fee,
+                        };
+                    }
+                    self.load_persisted_state();
                 }
                 ScanEvent::Reorg { fork_height } => {
                     // State was rolled back and is being rescanned.
@@ -604,6 +634,14 @@ impl AppState {
                     if let Some(warning) = warning {
                         self.last_error = Some(warning);
                     }
+                }
+                SendEvent::StoredForRetry { tx_hash, fee } => {
+                    self.send_stage = SendStage::StoredForRetry { tx_hash, fee };
+                    self.send_confirm_tx = None;
+                    // Inputs remain reserved in the durable pre-relay record;
+                    // showing the refreshed balance prevents a replacement
+                    // spend while the exact bytes await retry.
+                    self.load_persisted_state();
                 }
                 SendEvent::Failed(msg) => {
                     self.send_stage = SendStage::Failed(msg);
@@ -713,6 +751,7 @@ impl AppState {
         self.send_address = String::new();
         self.send_amount = String::new();
         self.send_sweep = false;
+        self.sweep_warning = false;
         self.send_stage = SendStage::Entering;
         self.send_confirm_tx = None;
         self.address_book.clear();
@@ -798,6 +837,22 @@ impl AppState {
         // Help overlay swallows all keys; any key closes it.
         if self.help_visible {
             self.help_visible = false;
+            return;
+        }
+
+        // Sweep-all can correlate every input it consolidates. Require a
+        // dedicated acknowledgement before any transaction construction.
+        if self.sweep_warning {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.sweep_warning = false;
+                    self.start_send_with_sweep_ack(true);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.sweep_warning = false;
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1107,16 +1162,18 @@ impl AppState {
                 }
                 _ => {}
             },
-            SendStage::Done { .. } | SendStage::Failed(_) => match key.code {
-                KeyCode::Enter | KeyCode::Esc => {
-                    self.send_stage = SendStage::Entering;
-                    self.send_address.clear();
-                    self.send_amount.clear();
-                    self.send_sweep = false;
-                    self.active_tab = 0;
+            SendStage::Done { .. } | SendStage::StoredForRetry { .. } | SendStage::Failed(_) => {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => {
+                        self.send_stage = SendStage::Entering;
+                        self.send_address.clear();
+                        self.send_amount.clear();
+                        self.send_sweep = false;
+                        self.active_tab = 0;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             SendStage::Preparing(_) | SendStage::Publishing => {
                 // Read-only stages; allow navigating back to the dashboard
                 // (the engine keeps running in the background).
@@ -1129,6 +1186,10 @@ impl AppState {
 
     /// Validate the form and spawn the send engine.
     fn start_send(&mut self) {
+        self.start_send_with_sweep_ack(false);
+    }
+
+    fn start_send_with_sweep_ack(&mut self, sweep_acknowledged: bool) {
         if self.wallet_keys.is_none() {
             self.send_stage = SendStage::Failed("No wallet loaded".to_string());
             return;
@@ -1190,6 +1251,10 @@ impl AppState {
         // payment instead).
         let sweep_all =
             self.send_sweep || (self.balance.unlocked > 0 && amount == self.balance.unlocked);
+        if sweep_all && !sweep_acknowledged {
+            self.sweep_warning = true;
+            return;
+        }
 
         let (confirm_tx, confirm_rx) = oneshot::channel::<bool>();
         self.send_confirm_tx = Some(confirm_tx);
@@ -1869,6 +1934,11 @@ impl AppState {
             }
             return;
         }
+        if self.sweep_warning {
+            // The warning intentionally requires an explicit keyboard
+            // acknowledgement; clicks cannot activate controls behind it.
+            return;
+        }
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1965,6 +2035,9 @@ impl AppState {
     /// focused input field, bypassing per-key handling (so e.g. uppercase
     /// letters in an address never trigger Shift+letter shortcuts).
     fn handle_paste(&mut self, text: &str) {
+        if self.sweep_warning {
+            return;
+        }
         let text = text.trim();
         if text.is_empty() {
             return;
@@ -2018,8 +2091,30 @@ impl AppState {
         }
     }
 
-    /// The address string for a receive-screen selection index
-    /// (0 = primary, 1.. = subaddresses 0/1, 0/2, ...).
+    /// Actual minor index represented by a receive-screen row. Rows after the
+    /// primary address start at the first subaddress not yet observed by the
+    /// scanner, rather than cycling through a fixed reusable set.
+    pub fn receive_subaddress_minor(&self, index: usize) -> u32 {
+        if index == 0 {
+            return 0;
+        }
+        let first_unused = self
+            .wallet_db
+            .as_ref()
+            .and_then(|db| db.next_receive_minor().ok())
+            .unwrap_or(1);
+        first_unused.saturating_add(index.saturating_sub(1) as u32)
+    }
+
+    pub fn receive_address_label(&self, index: usize) -> String {
+        if index == 0 {
+            "Primary".to_string()
+        } else {
+            format!("Sub #{}", self.receive_subaddress_minor(index))
+        }
+    }
+
+    /// The address string for a receive-screen selection index.
     pub fn receive_address_string(&self, index: usize) -> Option<String> {
         let keys = self.wallet_keys.as_ref()?;
         if index == 0 {
@@ -2027,7 +2122,7 @@ impl AppState {
         }
         let sub = monero::cryptonote::subaddress::Index {
             major: 0,
-            minor: index as u32,
+            minor: self.receive_subaddress_minor(index),
         };
         Some(keys.get_subaddress(sub).to_string())
     }
@@ -2071,7 +2166,9 @@ impl AppState {
 
         tokio::spawn(async move {
             let result = (|| -> color_eyre::Result<(monero_wallet::Scanner, _)> {
-                let wallet_scanner = crate::wallet::build_wallet_scanner(&keys)?;
+                let next_receive_minor = db.next_receive_minor()?;
+                let wallet_scanner =
+                    crate::wallet::build_wallet_scanner_with_cursor(&keys, next_receive_minor)?;
                 let spend = crate::wallet::send::spend_scalar(&keys.keypair.spend)?;
                 Ok((wallet_scanner, spend))
             })();

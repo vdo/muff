@@ -32,7 +32,8 @@ pub enum MnemonicError {
     UnknownWord(String),
     /// Checksum verification failed.
     InvalidChecksum,
-    /// The decoded bytes don't form a valid scalar.
+    /// A word triple does not decode to a value the encoder could have
+    /// produced (upstream's "mismatched word list" check).
     InvalidSeed,
 }
 
@@ -42,7 +43,7 @@ impl std::fmt::Display for MnemonicError {
             Self::InvalidWordCount(n) => write!(f, "Expected 25 words, got {}", n),
             Self::UnknownWord(w) => write!(f, "Unknown word: '{}'", w),
             Self::InvalidChecksum => write!(f, "Invalid checksum word"),
-            Self::InvalidSeed => write!(f, "Decoded seed is not a valid scalar"),
+            Self::InvalidSeed => write!(f, "Invalid seed: mismatched word list"),
         }
     }
 }
@@ -121,12 +122,35 @@ pub fn mnemonic_to_seed(words_str: &str) -> Result<[u8; 32], MnemonicError> {
         let w2 = indices[base + 1];
         let w3 = indices[base + 2];
 
-        let val = w1 as u64
+        // Upstream evaluates this in `uint32_t`, so the arithmetic wraps at
+        // 2^32; reducing the exact u64 result mod 2^32 is equivalent (mod-2^32
+        // arithmetic is a ring homomorphism, and the inner `%` operands are
+        // already < n in both).
+        let val = (w1 as u64
             + n as u64
                 * (((n as u64 + w2 as u64 - w1 as u64) % n as u64)
-                    + n as u64 * ((n as u64 + w3 as u64 - w2 as u64) % n as u64));
+                    + n as u64 * ((n as u64 + w3 as u64 - w2 as u64) % n as u64)))
+            as u32;
 
-        let bytes = (val as u32).to_le_bytes();
+        // Not every word triple is in the encoder's image: `val` is only
+        // recoverable when `val % n == w1`, which is how `bytes_to_words`
+        // chose `w1` in the first place. Without this check a triple that
+        // overflows 32 bits truncates silently and the phrase restores to a
+        // DIFFERENT seed — a wrong wallet rather than an error. This mirrors
+        // monero-project/monero `src/mnemonics/electrum-words.cpp`
+        // `words_to_bytes`:
+        //
+        //     if (!(w[0] % word_list_length == w[1]))
+        //     {
+        //       memwipe(w, sizeof(w));
+        //       MERROR("Invalid seed: mumble mumble");
+        //       return false;
+        //     }
+        if val % n as u32 != w1 as u32 {
+            return Err(MnemonicError::InvalidSeed);
+        }
+
+        let bytes = val.to_le_bytes();
         seed[i * 4] = bytes[0];
         seed[i * 4 + 1] = bytes[1];
         seed[i * 4 + 2] = bytes[2];
@@ -189,8 +213,22 @@ fn checksum_index(words: &[String]) -> usize {
 
 /// The 3-character unique prefix of a word, as used for checksum input and
 /// prefix matching (mirrors electrum-words' trimmed words).
+///
+/// Case is normalized first, matching `find_word_index`. This matters because
+/// the checksum compares the prefix of the user's raw 25th word against a
+/// prefix taken from the (lowercase) wordlist: without normalizing, words 1-24
+/// tolerated any capitalization while word 25 did not, so a perfectly valid
+/// phrase written in caps was rejected as "Invalid checksum word". Upstream is
+/// case-tolerant (monero-project/monero `tests/unit_tests/mnemonics.cpp`,
+/// `TEST(mnemonics, case_tolerance)`).
+///
+/// Lowercasing does not change any checksum value: every other caller passes
+/// wordlist entries, which are already lowercase.
 fn prefix_of(word: &str) -> String {
-    word.chars().take(PREFIX_LENGTH).collect()
+    word.chars()
+        .flat_map(char::to_lowercase)
+        .take(PREFIX_LENGTH)
+        .collect()
 }
 
 /// Official checksum: CRC32 over the concatenated 3-character prefixes of the
@@ -521,6 +559,297 @@ mod tests {
         panic!("test fixtures all coincided with the official checksum word");
     }
 
+    /// Cross-implementation vector: an English 25-word phrase together with
+    /// the private spend and view keys it must derive.
+    ///
+    /// Origin: monero-oxide/monero-wallet-util `seed/src/tests.rs`,
+    /// `test_original_seed` (the `Language::English` entry). That is the Rust
+    /// reference maintained alongside the `monero-wallet` crate this wallet
+    /// already depends on, and it tracks monero-project/monero's
+    /// `src/mnemonics/electrum-words.cpp` encoding.
+    ///
+    /// This is the check the roundtrip tests cannot make: they only prove
+    /// `seed_to_mnemonic` and `mnemonic_to_seed` agree with EACH OTHER. If the
+    /// wordlist ordering, the 3-words-to-4-bytes packing or the `sc_reduce32`
+    /// step diverged from upstream, every roundtrip test would still pass
+    /// while phrases written down from muff restored to a different address in
+    /// the official GUI/CLI.
+    #[test]
+    fn test_official_english_vector_derives_expected_keys() {
+        use crate::wallet::keys::derive_keys;
+
+        const PHRASE: &str = "washing thirsty occur lectures tuesday fainted toxic adapt \
+             abnormal memoir nylon mostly building shrugged online ember northern \
+             ruby woes dauntless boil family illness inroads northern";
+        const SPEND: &str = "c0af65c0dd837e666b9d0dfed62745f4df35aed7ea619b2798a709f0fe545403";
+        const VIEW: &str = "513ba91c538a5a9069e0094de90e927c0cd147fa10428ce3ac1afd49f63e3b01";
+
+        let seed = mnemonic_to_seed(PHRASE).expect("reference phrase must decode");
+        let keys = derive_keys(&seed, monero::Network::Mainnet);
+        assert_eq!(
+            hex::encode(keys.keypair.spend.as_bytes()),
+            SPEND,
+            "private spend key diverged from the reference implementation"
+        );
+        assert_eq!(
+            hex::encode(keys.keypair.view.as_bytes()),
+            VIEW,
+            "private view key diverged from the reference implementation"
+        );
+
+        // Re-encoding the decoded seed must reproduce the exact phrase,
+        // checksum word included.
+        assert_eq!(
+            seed_to_mnemonic(&seed).join(" "),
+            PHRASE.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+
+    /// A word triple outside the encoder's image must be rejected, not
+    /// silently truncated to a different seed.
+    ///
+    /// `w3 = w2 - 1` forces the third coefficient to its maximum (1625), which
+    /// pushes the reconstructed value past 2^32; upstream's
+    /// `val % word_list_length == w1` check catches exactly this.
+    #[test]
+    fn test_out_of_image_word_triple_rejected() {
+        let seed = sc_reduce32(&[42u8; 32]);
+        let mut words = seed_to_mnemonic(&seed);
+        words.truncate(SEED_LENGTH);
+
+        words[0] = WORDLIST[0].to_string();
+        words[1] = WORDLIST[2].to_string();
+        words[2] = WORDLIST[1].to_string();
+
+        // Give the tampered phrase a valid checksum word so the failure is
+        // attributable to the triple check alone, not the checksum.
+        let checksum_word = words[checksum_index(&words)].clone();
+        words.push(checksum_word);
+
+        assert_eq!(
+            mnemonic_to_seed(&words.join(" ")),
+            Err(MnemonicError::InvalidSeed),
+            "an unrepresentable word triple must error instead of decoding to a wrong seed"
+        );
+    }
+
+    /// The triple check must never reject a phrase this wallet produced.
+    ///
+    /// `test_out_of_image_word_triple_rejected` proves the check fires; this
+    /// proves it does not over-fire. A false rejection here would be far worse
+    /// than the bug the check fixes: it would lock a user out of a wallet
+    /// whose seed phrase is perfectly valid. The fixed-fixture roundtrip tests
+    /// cannot rule that out because they only cover a handful of seeds, and
+    /// the value that triggers the check depends on the *word indices*, not on
+    /// any obvious property of the seed bytes.
+    ///
+    /// Randomized rather than exhaustive: 2^256 seeds cannot be enumerated,
+    /// and a fresh sample every run accumulates coverage across CI runs. The
+    /// iteration count is kept low enough to stay a unit test — the cost is
+    /// dominated by the linear wordlist scan in `find_word_index`.
+    #[test]
+    fn test_generated_phrases_are_never_falsely_rejected() {
+        for i in 0..2_000 {
+            let (seed, words) = generate_mnemonic_seed();
+            let phrase = words.join(" ");
+            match mnemonic_to_seed(&phrase) {
+                Ok(decoded) => assert_eq!(decoded, seed, "iteration {i}: roundtrip mismatch"),
+                Err(e) => panic!("iteration {i}: generated phrase rejected ({e}): {phrase}"),
+            }
+        }
+    }
+
+    /// The wordlist property that both the checksum and prefix matching rest
+    /// on: truncating to 3 characters must be injective over the wordlist.
+    ///
+    /// The checksum compares 3-char prefixes rather than word indices, so if
+    /// two words shared a prefix the check would accept the wrong 25th word;
+    /// and `find_word_index`'s prefix fallback would resolve ambiguously. Both
+    /// silently weaken typo detection on the wallet's master secret, so this
+    /// is asserted rather than assumed.
+    #[test]
+    fn test_wordlist_three_char_prefixes_are_unique() {
+        let mut seen: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(WORDLIST.len());
+        for (i, word) in WORDLIST.iter().enumerate() {
+            assert!(
+                word.chars().count() >= PREFIX_LENGTH,
+                "'{word}' is shorter than the {PREFIX_LENGTH}-char prefix length"
+            );
+            if let Some(prev) = seen.insert(prefix_of(word), i) {
+                panic!(
+                    "'{}' and '{}' share the prefix '{}'",
+                    WORDLIST[prev],
+                    word,
+                    prefix_of(word)
+                );
+            }
+        }
+    }
+
+    /// Regression: capitalization must not change how a phrase decodes — for
+    /// the checksum word as much as for the other 24.
+    ///
+    /// `find_word_index` lowercases, so words 1-24 were always case-tolerant.
+    /// The checksum compared `prefix_of(raw_input)` against a lowercase
+    /// wordlist prefix, so a phrase restored from a backup written in caps
+    /// (or auto-capitalized on paste) failed with "Invalid checksum word"
+    /// despite being completely valid — the worst kind of restore error,
+    /// because it looks like the seed itself is wrong.
+    #[test]
+    fn test_capitalization_of_any_word_is_tolerated() {
+        let seed = sc_reduce32(&[0x5Au8; 32]);
+        let words = seed_to_mnemonic(&seed);
+        let canonical = words.join(" ");
+
+        assert_eq!(mnemonic_to_seed(&canonical).unwrap(), seed);
+        assert_eq!(
+            mnemonic_to_seed(&canonical.to_uppercase()).unwrap(),
+            seed,
+            "an all-uppercase phrase must decode"
+        );
+
+        // Capitalize exactly one word, at every position including the 25th.
+        for pos in 0..SEED_LENGTH_WITH_CHECKSUM {
+            let mut variant = words.clone();
+            let mut chars = variant[pos].chars();
+            variant[pos] = chars.next().unwrap().to_uppercase().to_string() + chars.as_str();
+            assert_eq!(
+                mnemonic_to_seed(&variant.join(" ")).unwrap(),
+                seed,
+                "capitalizing word {} must not change the decoded seed",
+                pos + 1
+            );
+        }
+    }
+
+    /// Whitespace and prefix-truncated input must decode identically to the
+    /// canonical phrase.
+    #[test]
+    fn test_equivalent_input_forms_decode_identically() {
+        let seed = sc_reduce32(&[0xC3u8; 32]);
+        let words = seed_to_mnemonic(&seed);
+
+        // Users paste phrases with tabs, newlines and ragged spacing.
+        let ragged = format!("  \t{}\n  ", words.join("  \n\t "));
+        assert_eq!(mnemonic_to_seed(&ragged).unwrap(), seed);
+
+        // The 3-char prefixes identify each word uniquely, checksum included.
+        let trimmed: Vec<String> = words.iter().map(|w| prefix_of(w)).collect();
+        assert_eq!(mnemonic_to_seed(&trimmed.join(" ")).unwrap(), seed);
+
+        // Over-long input truncates to its prefix, as upstream does.
+        let padded: Vec<String> = words.iter().map(|w| format!("{w}zzz")).collect();
+        assert_eq!(mnemonic_to_seed(&padded.join(" ")).unwrap(), seed);
+    }
+
+    /// Every boundary of the 4-bytes-to-3-words packing, in every chunk
+    /// position.
+    ///
+    /// The encoder splits each 4-byte chunk on `n` and `n^2`, so the
+    /// interesting values are the ones straddling those divisions and the
+    /// extremes of the u32 range — exactly where a division, modulo or
+    /// truncation mistake shows up and where uniform random seeds essentially
+    /// never land.
+    #[test]
+    fn test_chunk_boundary_values_roundtrip() {
+        let n = WORDLIST.len() as u32;
+        let n2 = n * n;
+        let edges: [u32; 18] = [
+            0,
+            1,
+            2,
+            n - 1,
+            n,
+            n + 1,
+            n2 - 1,
+            n2,
+            n2 + 1,
+            n2 * 1624, // largest exact multiple of n^2 below 2^32
+            0x0000_00FF,
+            0x0000_FF00,
+            0x00FF_0000,
+            0xFF00_0000,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+
+        // Each edge value repeated across all eight chunks.
+        for value in edges {
+            let mut seed = [0u8; 32];
+            for chunk in seed.chunks_mut(4) {
+                chunk.copy_from_slice(&value.to_le_bytes());
+            }
+            let words = seed_to_mnemonic(&seed);
+            assert_eq!(words.len(), SEED_LENGTH_WITH_CHECKSUM);
+            assert_eq!(
+                mnemonic_to_seed(&words.join(" ")).unwrap(),
+                seed,
+                "roundtrip failed for chunk value {value}"
+            );
+        }
+
+        // A different edge value in every chunk, so a position-dependent bug
+        // cannot hide behind eight identical chunks.
+        for offset in 0..edges.len() {
+            let mut seed = [0u8; 32];
+            for (i, chunk) in seed.chunks_mut(4).enumerate() {
+                chunk.copy_from_slice(&edges[(offset + i) % edges.len()].to_le_bytes());
+            }
+            let words = seed_to_mnemonic(&seed);
+            assert_eq!(
+                mnemonic_to_seed(&words.join(" ")).unwrap(),
+                seed,
+                "roundtrip failed for mixed-edge seed at offset {offset}"
+            );
+        }
+    }
+
+    /// The third coefficient can never reach `n - 1`, and a triple claiming it
+    /// must be rejected wherever it appears.
+    ///
+    /// `w3 = w2 - 1` encodes `B = n - 1 = 1625`, but `n^2 * 1625` already
+    /// exceeds 2^32, so no 4-byte chunk can produce it. Before the
+    /// `val % n == w1` check such a triple wrapped silently into a different
+    /// value — this asserts both that the value is genuinely unreachable and
+    /// that every chunk position rejects it (a loop that checked only the
+    /// first chunk would still pass the single-position test).
+    #[test]
+    fn test_maximal_third_coefficient_unreachable_and_rejected() {
+        let n = WORDLIST.len() as u64;
+        assert!(
+            n * n * (n - 1) > u64::from(u32::MAX),
+            "B = n - 1 must be unreachable from any u32 chunk"
+        );
+
+        let seed = sc_reduce32(&[0x11u8; 32]);
+        let base = seed_to_mnemonic(&seed);
+
+        for pos in 0..8 {
+            for (w1, w2) in [(0usize, 2usize), (37, 900), (1625, 1), (500, 0)] {
+                let mut words = base[..SEED_LENGTH].to_vec();
+                words[pos * 3] = WORDLIST[w1].to_string();
+                words[pos * 3 + 1] = WORDLIST[w2].to_string();
+                // w3 = w2 - 1 (mod n) drives the third coefficient to n - 1.
+                words[pos * 3 + 2] =
+                    WORDLIST[(w2 + WORDLIST.len() - 1) % WORDLIST.len()].to_string();
+
+                // Valid checksum word, so the rejection is attributable to the
+                // triple check alone.
+                let checksum_word = words[checksum_index(&words)].clone();
+                words.push(checksum_word);
+
+                assert_eq!(
+                    mnemonic_to_seed(&words.join(" ")),
+                    Err(MnemonicError::InvalidSeed),
+                    "chunk {pos} with (w1, w2) = ({w1}, {w2}) must be rejected"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_crc32_known_vectors() {
         assert_eq!(crc32(b""), 0x00000000);
@@ -578,7 +907,7 @@ mod tests {
         );
         assert_eq!(
             format!("{}", MnemonicError::InvalidSeed),
-            "Decoded seed is not a valid scalar"
+            "Invalid seed: mismatched word list"
         );
     }
 

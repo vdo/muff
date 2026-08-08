@@ -90,6 +90,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     }
     config::render_config_modal(frame, content_area, state);
     send::render_book_modal(frame, content_area, state);
+    send::render_sweep_warning(frame, content_area, state);
 
     // Help overlay on top of everything.
     if state.help_visible {

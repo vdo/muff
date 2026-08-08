@@ -33,14 +33,10 @@ impl CachedDistribution {
     }
 }
 
-/// Default fee quantization mask used by the Monero core wallet when the
-/// daemon doesn't provide a mask for a priority level.
-const DEFAULT_FEE_MASK: u64 = 10_000;
-
-/// Fee multiplier for a priority tier (monero-wallet-cli's table for the
-/// current fee algorithm, HF8+/per-byte: `{1, 5, 25, 1000}` indexed by
-/// `priority - 1`; `wallet2::get_fee_multiplier`). The daemon's
-/// `estimated_base_fee` is the tier-1 (unimportant) rate.
+/// Historic priority multipliers, retained only for bounding a maliciously
+/// high daemon response. Current monerod returns one already-adjusted rate per
+/// priority in `fees`; applying these to the returned rates would multiply the
+/// fee twice and make our transactions differ from wallet2.
 pub fn fee_multiplier(priority: u32) -> u64 {
     match priority {
         1 => 1,    // Unimportant / Low
@@ -48,6 +44,36 @@ pub fn fee_multiplier(priority: u32) -> u64 {
         3 => 25,   // Elevated
         _ => 1000, // Priority (and any out-of-range custom value)
     }
+}
+
+/// Current `/get_fee_estimate` response shape. The rates in `fees` are already
+/// ordered by wallet priority: slow, normal, fast, fastest.
+#[derive(Debug, serde::Deserialize)]
+struct FeeEstimateResponse {
+    #[allow(dead_code)]
+    fee: Option<u64>,
+    fees: Option<Vec<u64>>,
+    quantization_mask: Option<u64>,
+}
+
+fn fee_rate_from_response(priority: u32, response: FeeEstimateResponse) -> Result<FeeRate> {
+    let index = usize::try_from(
+        priority
+            .checked_sub(1)
+            .ok_or_else(|| color_eyre::eyre::eyre!("invalid fee priority {priority}"))?,
+    )
+    .map_err(|_| color_eyre::eyre::eyre!("invalid fee priority {priority}"))?;
+    let fees = response
+        .fees
+        .ok_or_else(|| color_eyre::eyre::eyre!("fee estimate is missing priority rates"))?;
+    let per_weight = fees.get(index).copied().ok_or_else(|| {
+        color_eyre::eyre::eyre!("fee estimate has no rate for priority {priority}")
+    })?;
+    let mask = response
+        .quantization_mask
+        .ok_or_else(|| color_eyre::eyre::eyre!("fee estimate is missing quantization_mask"))?;
+    FeeRate::new(per_weight, mask)
+        .ok_or_else(|| color_eyre::eyre::eyre!("daemon returned an invalid fee rate"))
 }
 
 /// Wrapper around the monero-rpc daemon client with connection state tracking.
@@ -83,6 +109,28 @@ pub struct NodeStatus {
     pub peer_count: u64,
     pub error: Option<String>,
 }
+
+/// A definitive daemon rejection is safe to rebuild (while reusing the saved
+/// rings); a transport or response failure is ambiguous and must only retry
+/// the exact same signed blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishError {
+    Rejected(String),
+    Ambiguous(String),
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) => write!(f, "daemon rejected transaction: {message}"),
+            Self::Ambiguous(message) => {
+                write!(f, "transaction relay result is uncertain: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PublishError {}
 
 /// Response from /get_info endpoint.
 #[derive(Debug, serde::Deserialize)]
@@ -364,58 +412,70 @@ impl DaemonClient {
 
     /// Query the daemon's recommended fee rate via `/get_fee_estimate`.
     ///
-    /// Falls back to a conservative static rate when the daemon doesn't
-    /// return one.
-    pub async fn fee_estimate(&self, priority: u32) -> FeeRate {
-        #[derive(serde::Deserialize)]
-        struct FeeEstimateResponse {
-            estimated_base_fee: Option<u64>,
-            fee_mask: Option<u64>,
-        }
-
+    /// The current network uses daemon-provided, already-tiered rates. Failing
+    /// closed is preferable to emitting a distinctive historic fallback fee.
+    pub async fn fee_estimate(&self, priority: u32) -> Result<FeeRate> {
         #[derive(serde::Serialize)]
         struct FeeEstimateRequest {
             grace_blocks: u32,
         }
 
-        // The daemon only reports the base (lowest-tier) fee; the priority
-        // scales it exactly like wallet2's HF8+ multiplier table.
-        let multiplier = fee_multiplier(priority);
-
-        let request = self
+        let response = self
             .http
             .post(format!("{}/get_fee_estimate", self.url().await))
-            .json(&FeeEstimateRequest { grace_blocks: 0 });
-
-        if let Ok(resp) = request.send().await
-            && let Ok(parsed) = resp.json::<FeeEstimateResponse>().await
-            && let Some(per_weight) = parsed.estimated_base_fee
-        {
-            let mask = parsed.fee_mask.unwrap_or(DEFAULT_FEE_MASK);
-            if let Some(rate) = FeeRate::new(per_weight.saturating_mul(multiplier), mask) {
-                return rate;
-            }
-        }
-
-        // Fallback: 20_000 atomic units per weight unit (monerod's historic
-        // default base fee), scaled by the priority multiplier.
-        FeeRate::new(20_000u64.saturating_mul(multiplier), DEFAULT_FEE_MASK)
-            .expect("static fee rate is valid")
+            // Matches wallet2's FEE_ESTIMATE_GRACE_BLOCKS.
+            .json(&FeeEstimateRequest { grace_blocks: 10 })
+            .send()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("get_fee_estimate failed: {e}"))?;
+        let parsed = response
+            .json::<FeeEstimateResponse>()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("get_fee_estimate: bad response: {e}"))?;
+        fee_rate_from_response(priority, parsed)
     }
 
     /// Publish a signed transaction to the daemon via `/sendrawtransaction`.
     ///
     /// Returns the daemon's status string ("OK" on success).
-    pub async fn publish_transaction(&self, tx_blob: &[u8]) -> Result<String> {
+    pub async fn publish_transaction(
+        &self,
+        tx_blob: &[u8],
+    ) -> std::result::Result<String, PublishError> {
         #[derive(serde::Serialize)]
         struct SendRawRequest {
             tx_as_hex: String,
             do_not_relay: bool,
+            do_sanity_checks: bool,
         }
         #[derive(serde::Deserialize)]
         struct SendRawResponse {
             status: Option<String>,
             reason: Option<String>,
+            #[serde(default)]
+            not_relayed: bool,
+            #[serde(default)]
+            double_spend: bool,
+            #[serde(default)]
+            low_mixin: bool,
+            #[serde(default)]
+            invalid_input: bool,
+            #[serde(default)]
+            invalid_output: bool,
+            #[serde(default)]
+            too_big: bool,
+            #[serde(default)]
+            overspend: bool,
+            #[serde(default)]
+            fee_too_low: bool,
+            #[serde(default)]
+            too_few_outputs: bool,
+            #[serde(default)]
+            sanity_check_failed: bool,
+            #[serde(default)]
+            tx_extra_too_big: bool,
+            #[serde(default)]
+            nonzero_unlock_time: bool,
         }
 
         let response = self
@@ -424,27 +484,54 @@ impl DaemonClient {
             .json(&SendRawRequest {
                 tx_as_hex: hex::encode(tx_blob),
                 do_not_relay: false,
+                do_sanity_checks: true,
             })
             .send()
             .await
-            .map_err(|e| color_eyre::eyre::eyre!("sendrawtransaction failed: {e}"))?;
+            .map_err(|e| PublishError::Ambiguous(format!("sendrawtransaction failed: {e}")))?;
 
-        let parsed: SendRawResponse = response
-            .json()
-            .await
-            .map_err(|e| color_eyre::eyre::eyre!("sendrawtransaction: bad response: {e}"))?;
+        let parsed: SendRawResponse = response.json().await.map_err(|e| {
+            PublishError::Ambiguous(format!("sendrawtransaction: bad response: {e}"))
+        })?;
 
         let status = parsed
             .status
             .clone()
             .unwrap_or_else(|| "Failed".to_string());
-        if status != "OK" {
-            let reason = parsed
+        if status != "OK" || parsed.not_relayed {
+            let mut reason = parsed
                 .reason
                 .unwrap_or_else(|| "unknown reason".to_string());
-            return Err(color_eyre::eyre::eyre!(
-                "daemon rejected transaction ({status}): {reason}"
-            ));
+            if parsed.not_relayed {
+                reason.push_str(" (daemon reports transaction was not relayed)");
+            }
+            if parsed.double_spend {
+                // This may mean an earlier submission of these exact bytes is
+                // already present, so it deliberately remains ambiguous.
+                reason.push_str(" (key image already spent)");
+            }
+            if parsed.sanity_check_failed {
+                reason.push_str(" (transaction sanity check failed)");
+            }
+            let invalid_transaction = parsed.low_mixin
+                || parsed.invalid_input
+                || parsed.invalid_output
+                || parsed.too_big
+                || parsed.overspend
+                || parsed.fee_too_low
+                || parsed.too_few_outputs
+                || parsed.sanity_check_failed
+                || parsed.tx_extra_too_big
+                || parsed.nonzero_unlock_time;
+            // A generic failure, duplicate, or double-spend response can be
+            // the result of an earlier successful relay. Only the daemon's
+            // explicit structural-invalid flags authorize rebuilding.
+            let message = format!("{status}: {reason}");
+            return Err(if invalid_transaction {
+                PublishError::Rejected(message)
+            } else {
+                PublishError::Ambiguous(message)
+            });
         }
         Ok(status)
     }
@@ -607,7 +694,11 @@ impl ProvidesUnvalidatedDecoys for DaemonClient {
 
 impl ProvidesUnvalidatedFeeRates for DaemonClient {
     async fn fee_rate(&self, priority: FeePriority) -> Result<FeeRate, FeeError> {
-        Ok(self.fee_estimate(priority.to_u32()).await)
+        self.fee_estimate(priority.to_u32()).await.map_err(|e| {
+            FeeError::InterfaceError(InterfaceError::InterfaceError(format!(
+                "fee estimate failed: {e:#}"
+            )))
+        })
     }
 }
 
@@ -689,5 +780,55 @@ impl DaemonClient {
             ));
         }
         Ok(statuses)
+    }
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    #[test]
+    fn selects_daemon_priority_rate_without_multiplying_it_again() {
+        let response = FeeEstimateResponse {
+            fee: Some(99),
+            fees: Some(vec![20, 100, 500, 20_000]),
+            quantization_mask: Some(10_000),
+        };
+        let rate = fee_rate_from_response(3, response).unwrap();
+        assert_eq!(rate.per_weight(), 500);
+        assert_eq!(rate.calculate_fee_from_weight(21), 20_000);
+    }
+
+    #[test]
+    fn malformed_or_incomplete_fee_estimates_fail_closed() {
+        let response = || FeeEstimateResponse {
+            fee: Some(20),
+            fees: Some(vec![20, 100, 500, 20_000]),
+            quantization_mask: Some(10_000),
+        };
+        assert!(fee_rate_from_response(0, response()).is_err());
+        assert!(fee_rate_from_response(5, response()).is_err());
+        assert!(
+            fee_rate_from_response(
+                1,
+                FeeEstimateResponse {
+                    fee: Some(20),
+                    fees: None,
+                    quantization_mask: Some(10_000),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            fee_rate_from_response(
+                1,
+                FeeEstimateResponse {
+                    fee: Some(20),
+                    fees: Some(vec![20]),
+                    quantization_mask: None,
+                },
+            )
+            .is_err()
+        );
     }
 }

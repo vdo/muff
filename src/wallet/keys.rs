@@ -332,6 +332,193 @@ mod tests {
         assert_ne!(primary, sub);
     }
 
+    /// The ed25519 group order l = 2^252 + 27742317777372353535851937790883648493,
+    /// little-endian, as `sc_reduce32` interprets its input.
+    const GROUP_ORDER_LE: [u8; 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
+        0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+    ];
+
+    /// Little-endian 256-bit addition (wrapping), for building scalar edges.
+    fn le_add(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = u16::from(a[i]) + u16::from(b[i]) + carry;
+            out[i] = sum as u8;
+            carry = sum >> 8;
+        }
+        out
+    }
+
+    /// Little-endian 256-bit subtraction (wrapping).
+    fn le_sub(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in 0..32 {
+            let diff = i16::from(a[i]) - i16::from(b[i]) - borrow;
+            if diff < 0 {
+                out[i] = (diff + 256) as u8;
+                borrow = 1;
+            } else {
+                out[i] = diff as u8;
+                borrow = 0;
+            }
+        }
+        out
+    }
+
+    fn le_from_u8(value: u8) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[0] = value;
+        out
+    }
+
+    /// `sc_reduce32` at the exact boundaries of the group order.
+    ///
+    /// Restoring a seed derives the spend key through this reduction, so a
+    /// mistake at the wrap point produces a wrong wallet for the affected
+    /// seeds — the class of bug the module docs record as having already
+    /// happened once (~1/16 of seeds derived a different address than the
+    /// official wallets). One value below, at, and above each multiple of l
+    /// is where such a mistake is visible.
+    #[test]
+    fn test_sc_reduce32_at_group_order_boundaries() {
+        let one = le_from_u8(1);
+        let l = GROUP_ORDER_LE;
+        let two_l = le_add(&l, &l);
+        let three_l = le_add(&two_l, &l);
+
+        // Below l: unchanged.
+        assert_eq!(sc_reduce32(&le_sub(&l, &one)), le_sub(&l, &one));
+        assert_eq!(sc_reduce32(&le_from_u8(0)), le_from_u8(0));
+        assert_eq!(sc_reduce32(&one), one);
+
+        // Exact multiples reduce to zero.
+        assert_eq!(sc_reduce32(&l), [0u8; 32]);
+        assert_eq!(sc_reduce32(&two_l), [0u8; 32]);
+        assert_eq!(sc_reduce32(&three_l), [0u8; 32]);
+
+        // One past each multiple reduces to one.
+        assert_eq!(sc_reduce32(&le_add(&l, &one)), one);
+        assert_eq!(sc_reduce32(&le_add(&two_l, &one)), one);
+        assert_eq!(sc_reduce32(&le_add(&three_l, &one)), one);
+
+        // One before each multiple reduces to l - 1.
+        let l_minus_one = le_sub(&l, &one);
+        assert_eq!(sc_reduce32(&le_sub(&two_l, &one)), l_minus_one);
+        assert_eq!(sc_reduce32(&le_sub(&three_l, &one)), l_minus_one);
+
+        // The largest possible input is still reduced, canonical, and stable.
+        let max = [0xffu8; 32];
+        let reduced = sc_reduce32(&max);
+        assert_ne!(reduced, max);
+        assert_eq!(
+            sc_reduce32(&reduced),
+            reduced,
+            "reduction must be idempotent"
+        );
+        assert!(PrivateKey::from_slice(&reduced).is_ok());
+    }
+
+    /// Every reduction must yield a key the `monero` crate accepts, including
+    /// for inputs deliberately placed above the group order.
+    #[test]
+    fn test_sc_reduce32_always_yields_a_canonical_key() {
+        let mut inputs: Vec<[u8; 32]> = vec![[0u8; 32], [0xffu8; 32], GROUP_ORDER_LE];
+        for byte in [0x0f, 0x10, 0x11, 0x7f, 0x80, 0xfe] {
+            let mut candidate = [0xffu8; 32];
+            candidate[31] = byte;
+            inputs.push(candidate);
+        }
+        for _ in 0..256 {
+            inputs.push(generate_seed());
+        }
+        for input in inputs {
+            let reduced = sc_reduce32(&input);
+            assert!(
+                PrivateKey::from_slice(&reduced).is_ok(),
+                "sc_reduce32({}) is not a canonical scalar",
+                hex::encode(input)
+            );
+            assert_eq!(sc_reduce32(&reduced), reduced);
+        }
+    }
+
+    /// Cross-implementation check: the addresses shown to the user and the
+    /// view pair the scanner scans with must agree.
+    ///
+    /// `keys.rs` derives addresses through the `monero` crate, while
+    /// `scanner.rs` scans through a `monero-wallet` (monero-oxide) `ViewPair`
+    /// built from the same keys. These are two independent implementations of
+    /// Monero's address derivation, so agreeing is real evidence rather than
+    /// self-consistency — and disagreeing would be severe: the Receive tab
+    /// would hand out addresses whose incoming funds the scanner can never
+    /// see, with no error anywhere.
+    ///
+    /// Covers the primary address, the subaddresses the Receive tab offers
+    /// (`0/1`..`0/4`), the edge of the scanner's registration window
+    /// (`0/19`), and indices outside it, on all three networks.
+    #[test]
+    fn test_addresses_match_independent_implementation() {
+        use crate::wallet::scanner::build_view_pair;
+        use crate::wallet::send::wallet_network;
+        use monero_wallet::address::SubaddressIndex;
+
+        for fill in [0x00u8, 0x01, 0x42, 0xAA, 0xFF] {
+            let seed = sc_reduce32(&[fill; 32]);
+            for network in [Network::Mainnet, Network::Stagenet, Network::Testnet] {
+                let keys = derive_keys(&seed, network);
+                let view_pair = build_view_pair(&keys).expect("view pair must build");
+                let oxide_network = wallet_network(network);
+
+                assert_eq!(
+                    keys.primary_address().to_string(),
+                    view_pair.legacy_address(oxide_network).to_string(),
+                    "primary address mismatch (seed {fill:#04x}, {network:?})"
+                );
+
+                for (major, minor) in [(0u32, 1u32), (0, 4), (0, 19), (0, 20), (1, 0), (3, 7)] {
+                    let index = SubaddressIndex::new(major, minor).expect("non-zero index");
+                    assert_eq!(
+                        keys.get_subaddress(subaddress::Index { major, minor })
+                            .to_string(),
+                        view_pair.subaddress(oxide_network, index).to_string(),
+                        "subaddress {major}/{minor} mismatch (seed {fill:#04x}, {network:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Addresses must be distinct per network and per subaddress index.
+    ///
+    /// Guards against a mapping collapse (e.g. the network argument being
+    /// dropped, or an index being ignored) that the equality checks above
+    /// would not notice if both implementations were fed the same wrong value.
+    #[test]
+    fn test_addresses_are_distinct_across_networks_and_indices() {
+        let seed = sc_reduce32(&[0x37u8; 32]);
+        let mut seen = std::collections::HashSet::new();
+
+        for network in [Network::Mainnet, Network::Stagenet, Network::Testnet] {
+            let keys = derive_keys(&seed, network);
+            assert!(
+                seen.insert(keys.address_string()),
+                "primary address repeats across networks at {network:?}"
+            );
+            for minor in 1..8u32 {
+                let address = keys
+                    .get_subaddress(subaddress::Index { major: 0, minor })
+                    .to_string();
+                assert!(
+                    seen.insert(address),
+                    "subaddress 0/{minor} collides at {network:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_generate_seed_randomness() {
         let s1 = generate_seed();

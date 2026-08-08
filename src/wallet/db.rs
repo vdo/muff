@@ -25,7 +25,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use color_eyre::eyre::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -301,6 +301,16 @@ impl WalletDb {
                 address TEXT NOT NULL,
                 created_at INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS rings (
+                key_image TEXT PRIMARY KEY,
+                ring_blob BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_transactions (
+                tx_hash TEXT PRIMARY KEY,
+                tx_blob BLOB NOT NULL,
+                relayed INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0
+            );
             CREATE INDEX IF NOT EXISTS idx_outputs_spent ON outputs(spent);
             CREATE INDEX IF NOT EXISTS idx_history_hash ON history(tx_hash);
             ",
@@ -480,6 +490,24 @@ impl WalletDb {
         String::from_utf8(raw).context("corrupt network value in wallet db")
     }
 
+    /// First unused account-0 subaddress shown on the receive screen. Older
+    /// wallets did not persist allocation state, so they begin at 0/1.
+    pub fn next_receive_minor(&self) -> Result<u32> {
+        Ok(self
+            .meta_u64("next_receive_minor")?
+            .max(1)
+            .min(u32::MAX as u64) as u32)
+    }
+
+    /// Move the receive cursor forward, never backward. This lets a restored
+    /// wallet discover a used address and stop offering it again.
+    pub fn advance_receive_minor(&self, next: u32) -> Result<()> {
+        if next > self.next_receive_minor()? {
+            self.set_meta_u64("next_receive_minor", u64::from(next))?;
+        }
+        Ok(())
+    }
+
     fn meta_u64(&self, key: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let raw: Option<Vec<u8>> = conn
@@ -585,6 +613,10 @@ impl WalletDb {
                 "UPDATE outputs SET spent_tx=NULL WHERE spent_tx=?1",
                 params![txid],
             )?;
+            conn.execute(
+                "DELETE FROM pending_transactions WHERE tx_hash=?1",
+                params![txid],
+            )?;
         }
         Ok(n > 0)
     }
@@ -594,7 +626,10 @@ impl WalletDb {
     pub fn pending_out_transfers(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT tx_hash FROM history WHERE direction='Out' AND confirmed=0 AND failed=0",
+            "SELECT h.tx_hash FROM history h
+             LEFT JOIN pending_transactions p ON p.tx_hash=h.tx_hash
+             WHERE h.direction='Out' AND h.confirmed=0 AND h.failed=0
+               AND (p.tx_hash IS NULL OR p.relayed=1)",
         )?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))?
@@ -619,7 +654,10 @@ impl WalletDb {
         }
         let pending: std::collections::HashSet<String> = {
             let mut stmt = conn.prepare(
-                "SELECT tx_hash FROM history WHERE direction='Out' AND confirmed=0 AND failed=0",
+                "SELECT h.tx_hash FROM history h
+                 LEFT JOIN pending_transactions p ON p.tx_hash=h.tx_hash
+                 WHERE h.direction='Out' AND h.confirmed=0 AND h.failed=0
+                   AND (p.tx_hash IS NULL OR p.relayed=1)",
             )?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .filter_map(|r| r.ok())
@@ -675,6 +713,10 @@ impl WalletDb {
                 "UPDATE history SET failed=1 WHERE tx_hash=?1 AND direction='Out'",
                 params![t],
             )?;
+            conn.execute(
+                "DELETE FROM pending_transactions WHERE tx_hash=?1",
+                params![t],
+            )?;
         }
         Ok(txid)
     }
@@ -684,7 +726,7 @@ impl WalletDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT key_hex, wallet_output_hex, amount, height, timestamp, spent, spent_tx
-             FROM outputs WHERE spent=0",
+             FROM outputs WHERE spent=0 ORDER BY height ASC, timestamp ASC, rowid ASC",
         )?;
         let rows = stmt
             .query_map([], row_to_output)?
@@ -692,51 +734,191 @@ impl WalletDb {
         Ok(rows)
     }
 
-    /// Reserve an output for a specific outgoing tx (after successful publish).
-    pub fn mark_spent_by(&self, key_hex: &str, txid: &str) -> Result<()> {
+    /// Previously committed ring for a key image, if any. Ring data is kept
+    /// after a failed or dropped transaction so reconstructing a spend cannot
+    /// create a second, intersectable ring for the same true output.
+    pub fn ring_for_key_image(&self, key_image: &str) -> Result<Option<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE outputs SET spent=1, spent_tx=?1 WHERE key_hex=?2",
-            params![txid, key_hex],
-        )?;
-        Ok(())
+        Ok(conn
+            .query_row(
+                "SELECT ring_blob FROM rings WHERE key_image=?1",
+                params![key_image],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
-    /// Atomically reserve all inputs and add the pending outgoing history
-    /// record after a transaction has been published.
-    pub fn record_published_transfer(
+    /// Atomically commit the signed transaction, its rings, input reservations
+    /// and history record before the first network write.
+    pub fn record_signed_transfer(
         &self,
         input_keys: &[String],
+        rings: &[(String, Vec<u8>)],
+        tx_blob: &[u8],
         record: &TransferRecord,
     ) -> Result<()> {
+        if input_keys.is_empty() || input_keys.len() != rings.len() {
+            bail!("signed transfer must have one committed ring per input");
+        }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        for (key_image, ring_blob) in rings {
+            let existing: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT ring_blob FROM rings WHERE key_image=?1",
+                    params![key_image],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match existing {
+                Some(existing) if existing != *ring_blob => {
+                    // Never silently replace a committed ring. Two rings for
+                    // one key image are intersectable and can identify the
+                    // real output even if only one transaction is relayed.
+                    bail!("attempted to replace the committed ring for key image {key_image}");
+                }
+                Some(_) => {}
+                None => {
+                    tx.execute(
+                        "INSERT INTO rings(key_image, ring_blob) VALUES(?1, ?2)",
+                        params![key_image, ring_blob],
+                    )?;
+                }
+            }
+        }
         for key_hex in input_keys {
             let changed = tx.execute(
                 "UPDATE outputs SET spent=1, spent_tx=?1
-                 WHERE key_hex=?2 AND (spent_tx IS NULL OR spent_tx=?1)",
+                 WHERE key_hex=?2 AND spent=0 AND spent_tx IS NULL",
                 params![record.tx_hash, key_hex],
             )?;
             if changed != 1 {
-                bail!("published input {key_hex} is missing or reserved by another transfer");
+                bail!("signed input {key_hex} is missing or reserved by another transfer");
             }
         }
         tx.execute(
             "INSERT INTO history
              (tx_hash, height, timestamp, amount, fee, direction, confirmed, failed, note)
-             VALUES(?1, ?2, ?3, ?4, ?5, 'Out', ?6, ?7, ?8)",
+             VALUES(?1, ?2, ?3, ?4, ?5, 'Out', 0, 0, ?6)",
             params![
                 record.tx_hash,
                 record.height as i64,
                 record.timestamp as i64,
                 record.amount as i64,
                 record.fee as i64,
-                record.confirmed as i64,
-                record.failed as i64,
                 record.note,
             ],
         )?;
+        tx.execute(
+            "INSERT INTO pending_transactions(tx_hash, tx_blob, relayed, created_at)
+             VALUES(?1, ?2, 0, ?3)",
+            params![record.tx_hash, tx_blob, record.timestamp as i64],
+        )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_transaction_relayed(&self, tx_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pending_transactions SET relayed=1 WHERE tx_hash=?1",
+            params![tx_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Signed transactions whose first broadcast had an ambiguous result.
+    /// The caller supplies a cutoff so a scanner cannot race the send task's
+    /// immediate first relay; duplicate exact-byte submission is safe, but
+    /// avoiding it keeps state and logs deterministic.
+    pub fn unrelayed_transactions(&self, created_before: u64) -> Result<Vec<(String, Vec<u8>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tx_hash, tx_blob FROM pending_transactions
+             WHERE relayed=0 AND created_at <= ?1 ORDER BY rowid",
+        )?;
+        let created_before = created_before.min(i64::MAX as u64) as i64;
+        Ok(stmt
+            .query_map(params![created_before], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Whether `tx_hash` is signed and reserved but not yet known relayed.
+    pub fn transaction_awaiting_relay(&self, tx_hash: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM pending_transactions WHERE tx_hash=?1 AND relayed=0",
+                params![tx_hash],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Outputs reserved by a particular signed outgoing transaction. Used to
+    /// derive its key images when resolving an ambiguous relay without ever
+    /// constructing a replacement transaction.
+    pub fn outputs_reserved_by(&self, tx_hash: &str) -> Result<Vec<StoredOutput>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT key_hex, wallet_output_hex, amount, height, timestamp, spent, spent_tx
+             FROM outputs WHERE spent=1 AND spent_tx=?1",
+        )?;
+        Ok(stmt
+            .query_map(params![tx_hash], row_to_output)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A definitive daemon rejection makes the signed transaction unusable.
+    /// Release its inputs but deliberately retain its rings for any rebuild.
+    pub fn reject_signed_transfer(&self, tx_hash: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE outputs SET spent=0, spent_tx=NULL WHERE spent_tx=?1",
+            params![tx_hash],
+        )?;
+        tx.execute(
+            "UPDATE history SET failed=1 WHERE tx_hash=?1 AND direction='Out'",
+            params![tx_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_transactions WHERE tx_hash=?1",
+            params![tx_hash],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Undo an in-memory reservation when the pre-relay encrypted snapshot
+    /// could not be written. No network call has happened in this case, so the
+    /// history entry must disappear rather than look like a failed payment.
+    /// Rings are intentionally retained: reusing one is always safer than
+    /// accidentally producing two rings for the same true output.
+    pub fn rollback_unpersisted_transfer(&self, tx_hash: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE outputs SET spent=0, spent_tx=NULL WHERE spent_tx=?1",
+            params![tx_hash],
+        )?;
+        tx.execute("DELETE FROM history WHERE tx_hash=?1", params![tx_hash])?;
+        tx.execute(
+            "DELETE FROM pending_transactions WHERE tx_hash=?1",
+            params![tx_hash],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn mark_spent_by(&self, key_hex: &str, txid: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE outputs SET spent=1, spent_tx=?1 WHERE key_hex=?2",
+            params![txid, key_hex],
+        )?;
         Ok(())
     }
 
@@ -1347,33 +1529,111 @@ mod tests {
     }
 
     #[test]
-    fn test_published_transfer_bookkeeping_is_atomic() {
+    fn signed_transfer_persists_exact_blob_and_immutable_ring() {
         let path = temp_path("muff.wallet");
-        let db = WalletDb::create(&path, b"pw", &[9u8; 32], "mainnet", 0).unwrap();
+        let db = WalletDb::create(&path, b"pw", &[11u8; 32], "mainnet", 0).unwrap();
+        db.insert_received_output(&test_output("input-a", 900, 10), "in-a", "n")
+            .unwrap();
+
+        let first = out_record("signed-a", 0);
+        let ring = ("image-a".to_string(), vec![1, 2, 3]);
+        db.record_signed_transfer(
+            &["input-a".into()],
+            std::slice::from_ref(&ring),
+            &[9, 8, 7],
+            &first,
+        )
+        .unwrap();
+        assert_eq!(
+            db.ring_for_key_image("image-a").unwrap(),
+            Some(ring.1.clone())
+        );
+        assert_eq!(
+            db.unrelayed_transactions(u64::MAX).unwrap(),
+            vec![("signed-a".to_string(), vec![9, 8, 7])]
+        );
+        assert!(db.pending_out_transfers().unwrap().is_empty());
+        assert!(db.transaction_awaiting_relay("signed-a").unwrap());
+
+        db.reject_signed_transfer("signed-a").unwrap();
+        assert!(
+            db.spendable_outputs()
+                .unwrap()
+                .iter()
+                .any(|o| o.key_hex == "input-a")
+        );
+        assert_eq!(
+            db.ring_for_key_image("image-a").unwrap(),
+            Some(ring.1.clone())
+        );
+
+        let replacement = out_record("signed-b", 0);
+        assert!(
+            db.record_signed_transfer(
+                &["input-a".into()],
+                &[("image-a".to_string(), vec![4, 5, 6])],
+                &[6, 5, 4],
+                &replacement,
+            )
+            .is_err(),
+            "a replacement ring for the same key image must be refused"
+        );
+        db.record_signed_transfer(&["input-a".into()], &[ring], &[6, 5, 4], &replacement)
+            .unwrap();
+        db.mark_transaction_relayed("signed-b").unwrap();
+        assert!(db.unrelayed_transactions(u64::MAX).unwrap().is_empty());
+        assert_eq!(db.pending_out_transfers().unwrap(), vec!["signed-b"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn signed_transfer_reservation_is_atomic() {
+        let path = temp_path("muff.wallet");
+        let db = WalletDb::create(&path, b"pw", &[13u8; 32], "mainnet", 0).unwrap();
         db.insert_received_output(&test_output("input-a", 400, 10), "in-a", "n")
             .unwrap();
         db.insert_received_output(&test_output("input-b", 600, 11), "in-b", "n")
             .unwrap();
         db.mark_spent_by("input-b", "another-transfer").unwrap();
 
-        let record = out_record("published-transfer", 0);
+        let record = out_record("signed-conflict", 0);
         assert!(
-            db.record_published_transfer(&["input-a".into(), "input-b".into()], &record)
-                .is_err()
+            db.record_signed_transfer(
+                &["input-a".into(), "input-b".into()],
+                &[("image-a".into(), vec![1]), ("image-b".into(), vec![2])],
+                &[7, 7, 7],
+                &record,
+            )
+            .is_err()
         );
-        // The first update was rolled back along with the conflict on the
-        // second input, and no partial history row escaped the transaction.
         let (outputs, history) = db.ui_snapshot().unwrap();
-        let input_a = outputs.iter().find(|o| o.key_hex == "input-a").unwrap();
-        assert!(!input_a.spent);
-        assert!(!history.iter().any(|r| r.tx_hash == "published-transfer"));
-
-        db.release_output("input-b").unwrap();
-        db.record_published_transfer(&["input-a".into(), "input-b".into()], &record)
+        let input_a = outputs
+            .iter()
+            .find(|output| output.key_hex == "input-a")
             .unwrap();
-        let (outputs, history) = db.ui_snapshot().unwrap();
-        assert!(outputs.iter().all(|output| output.spent));
-        assert!(history.iter().any(|r| r.tx_hash == "published-transfer"));
+        assert!(!input_a.spent);
+        assert!(db.ring_for_key_image("image-a").unwrap().is_none());
+        assert!(
+            !history
+                .iter()
+                .any(|entry| entry.tx_hash == "signed-conflict")
+        );
+        assert!(db.unrelayed_transactions(u64::MAX).unwrap().is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn receive_subaddress_cursor_only_moves_forward() {
+        let path = temp_path("muff.wallet");
+        let db = WalletDb::create(&path, b"pw", &[12u8; 32], "mainnet", 0).unwrap();
+        assert_eq!(db.next_receive_minor().unwrap(), 1);
+        db.advance_receive_minor(8).unwrap();
+        db.advance_receive_minor(3).unwrap();
+        assert_eq!(db.next_receive_minor().unwrap(), 8);
+        db.save().unwrap();
+        drop(db);
+        let reopened = WalletDb::open(&path, b"pw").unwrap();
+        assert_eq!(reopened.next_receive_minor().unwrap(), 8);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

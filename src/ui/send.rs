@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{AppState, MouseRegion, SendField, SendStage};
 use crate::ui::Regions;
@@ -88,6 +88,43 @@ pub fn render_send(frame: &mut Frame, area: Rect, state: &AppState, regions: &mu
                 )),
             ],
         ),
+        SendStage::StoredForRetry { tx_hash, fee } => render_status(
+            frame,
+            area,
+            " Relay Pending ",
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  The relay result was uncertain.",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  The exact signed transaction is saved and will be retried.",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(Span::styled(
+                    "  Do not create a replacement; its inputs remain reserved.",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Tx hash: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(tx_hash, Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Fee:     ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format_xmr(*fee), Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Press Enter to continue.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+        ),
         SendStage::Failed(msg) => render_status(
             frame,
             area,
@@ -106,6 +143,53 @@ pub fn render_send(frame: &mut Frame, area: Rect, state: &AppState, regions: &mu
             ],
         ),
     }
+}
+
+/// Render the sweep-all privacy acknowledgement above the send form.
+pub fn render_sweep_warning(frame: &mut Frame, area: Rect, state: &AppState) {
+    if !state.sweep_warning {
+        return;
+    }
+    let popup = crate::ui::centered_rect(area, 70, 15);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Sweep-all spends every unlocked output in one transaction.",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  If those outputs came from different senders or subaddresses,"),
+        Line::from("  consolidating them can link those payment histories on-chain."),
+        Line::from(""),
+        Line::from("  The recipient receives the entire unlocked balance minus fee."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  [Y] Continue sweep   ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "[N] Cancel",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Sweep-all privacy warning ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 /// Keep long error messages readable in the status pane.
@@ -243,11 +327,7 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState, regions: &mut Re
         Line::from(vec![
             Span::styled("  Priority: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!(
-                    "{} ({}x base)",
-                    state.send_fee_priority.label(),
-                    state.send_fee_priority.multiplier()
-                ),
+                state.send_fee_priority.label(),
                 Style::default().fg(Color::White),
             ),
         ]),

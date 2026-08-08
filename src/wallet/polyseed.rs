@@ -66,11 +66,15 @@ struct PolyseedData {
 }
 
 /// `birthday_encode`: unix time -> 10-bit encoded birthday (clamped).
+///
+/// The clamp is applied in `u64`: narrowing first would let a clock set far
+/// enough ahead (>= 2^32 time steps past the epoch) wrap to a small value
+/// instead of saturating at `DATE_MASK`.
 fn birthday_encode(time: u64) -> u16 {
     if time == u64::MAX || time < EPOCH {
         return 0;
     }
-    (((time - EPOCH) / TIME_STEP) as u32).min(DATE_MASK) as u16
+    ((time - EPOCH) / TIME_STEP).min(DATE_MASK as u64) as u16
 }
 
 /// `birthday_decode`: encoded birthday -> approximate unix time.
@@ -405,6 +409,85 @@ mod tests {
         assert_eq!(polyseed_to_key(GOLDEN_PHRASE).unwrap().0, key);
     }
 
+    /// Cross-implementation KDF vector: a phrase and the exact 32 bytes
+    /// `polyseed_keygen` must produce for it.
+    ///
+    /// Origin: monero-oxide/monero-wallet-util `polyseed/src/tests.rs`,
+    /// `test_key`. tevador/polyseed's own `tests/tests.c` calls
+    /// `polyseed_keygen` but never compares its output to a constant, so this
+    /// Rust reference — maintained alongside the `monero-wallet` crate this
+    /// wallet depends on — is the usable source of a pinned key.
+    ///
+    /// This covers everything the existing golden-phrase test does not: the
+    /// `"POLYSEED key"` salt layout (including the 0xff domain bytes at
+    /// 13..16 and the little-endian coin/birthday/features at 16..28), the
+    /// 10 000-iteration PBKDF2-HMAC-SHA256, and the secret's zero-padding to
+    /// 32 bytes. A mistake in any of those still yields a valid-looking
+    /// private key, so without a pinned vector the failure mode is silent:
+    /// seeds written down from muff would not restore in Feather/Cake.
+    ///
+    /// Note the reference exposes the RAW KDF output, before the reduction
+    /// mod l that produces a Monero spend key — byte 31 here is 0x7e, well
+    /// above l's leading 0x10, so this value is not a canonical scalar.
+    /// `data_to_key` applies `sc_reduce32` on top, which is asserted too.
+    #[test]
+    fn test_keygen_matches_reference_vector() {
+        const PHRASE: &str = "comic blanket chair inject end snow rural improve cereal \
+             better initial replace ribbon brother gather unaware";
+        const RAW_KEY: [u8; 32] = [
+            216, 82, 37, 164, 252, 122, 170, 61, 52, 152, 131, 26, 181, 226, 191, 131, 204, 3, 242,
+            225, 229, 175, 37, 151, 18, 143, 53, 175, 136, 17, 47, 126,
+        ];
+
+        let words: Vec<&str> = PHRASE.split_whitespace().collect();
+        assert_eq!(words.len(), POLYSEED_WORDS);
+        let mut coeff = [0u16; POLYSEED_WORDS];
+        for (i, word) in words.iter().enumerate() {
+            coeff[i] = find_bip39_index(word).unwrap();
+        }
+        assert_eq!(
+            gf_poly_eval(&coeff),
+            0,
+            "reference phrase checksum must hold"
+        );
+
+        let data = poly_to_data(&coeff);
+        assert_eq!(data.features, 0);
+        let raw = polyseed_keygen(&data.secret, data.birthday as u32, data.features as u32);
+        assert_eq!(
+            raw, RAW_KEY,
+            "polyseed KDF diverged from the reference implementation"
+        );
+
+        // The public API returns the same value reduced to a canonical scalar.
+        let (key, _) = polyseed_to_key(PHRASE).expect("reference phrase must decode");
+        assert_eq!(key, super::super::keys::sc_reduce32(&RAW_KEY));
+        assert!(monero::util::key::PrivateKey::from_slice(&key).is_ok());
+    }
+
+    /// The 150-bit secret the golden phrase must decode to.
+    ///
+    /// Origin: monero-oxide/monero-wallet-util `polyseed/src/tests.rs`,
+    /// `test_polyseed`, the `Language::English` vector (`entropy` field, which
+    /// is the 19-byte secret zero-padded to 32 bytes).
+    #[test]
+    fn test_golden_vector_entropy_matches_reference() {
+        const ENTROPY: &str = "dd76e7359a0ded37cd0ff0f3c829a5ae01673300000000000000000000000000";
+
+        let coeff = golden_coeff();
+        let data = poly_to_data(&coeff);
+        let expected = hex::decode(ENTROPY).unwrap();
+        assert_eq!(
+            data.secret[..],
+            expected[..SECRET_SIZE],
+            "decoded secret diverged from the reference implementation"
+        );
+        assert!(
+            expected[SECRET_SIZE..].iter().all(|b| *b == 0),
+            "reference entropy must be zero-padded past the 19-byte secret"
+        );
+    }
+
     #[test]
     fn test_generate_roundtrip() {
         let (words, key, birthday) = generate_polyseed();
@@ -413,6 +496,89 @@ mod tests {
         let (key2, birthday2) = polyseed_to_key(&words.join(" ")).unwrap();
         assert_eq!(key, key2);
         assert_eq!(birthday, birthday2);
+    }
+
+    /// Random secrets must survive the full words round trip: packing,
+    /// checksum, wordlist mapping and unpacking.
+    ///
+    /// The checksum digit and the bit-packing both depend on the secret, so a
+    /// packing edge case (a carry across a byte boundary, the 6-bit tail in
+    /// `secret[18]`, a birthday at the 10-bit limit) can hide behind any one
+    /// fixture — and a failure means a user could write down 16 words that do
+    /// not restore. `test_data_poly_roundtrip` covers one fixed secret; this
+    /// samples fresh ones every run so coverage accumulates across CI runs.
+    ///
+    /// Deliberately skips `data_to_key`: the KDF is pinned exactly by
+    /// `test_keygen_matches_reference_vector`, and running two
+    /// 10 000-iteration PBKDF2 derivations per sample would dominate the
+    /// runtime of the whole suite for no added coverage of the packing.
+    #[test]
+    fn test_random_secrets_always_roundtrip_through_words() {
+        use rand::RngCore;
+
+        for i in 0..1_000 {
+            let mut secret = [0u8; SECRET_SIZE];
+            rand::thread_rng().fill_bytes(&mut secret);
+            secret[SECRET_SIZE - 1] &= 0x3f; // exactly 150 bits
+            let birthday = (rand::random::<u32>() & DATE_MASK) as u16;
+
+            let data = PolyseedData {
+                secret,
+                features: 0,
+                birthday,
+            };
+            let mut coeff = data_to_poly(&data);
+            coeff[0] = gf_poly_eval(&coeff);
+
+            let phrase = coeff
+                .iter()
+                .map(|&idx| BIP39_WORDLIST[idx as usize])
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            // Re-derive the digits from the words, exactly as decoding does.
+            let mut parsed = [0u16; POLYSEED_WORDS];
+            for (slot, word) in parsed.iter_mut().zip(phrase.split_whitespace()) {
+                *slot = find_bip39_index(word)
+                    .unwrap_or_else(|e| panic!("iteration {i}: {e} in {phrase}"));
+            }
+            assert_eq!(
+                parsed, coeff,
+                "iteration {i}: word mapping is not injective"
+            );
+            assert_eq!(
+                gf_poly_eval(&parsed),
+                0,
+                "iteration {i}: checksum does not verify for {phrase}"
+            );
+
+            let back = poly_to_data(&parsed);
+            assert_eq!(back.secret, secret, "iteration {i}: secret mismatch");
+            assert_eq!(back.features, 0, "iteration {i}: features mismatch");
+            assert_eq!(back.birthday, birthday, "iteration {i}: birthday mismatch");
+        }
+    }
+
+    /// End-to-end check that a freshly generated phrase restores to the same
+    /// key and birthday. Kept to a few samples because each iteration runs
+    /// two 10 000-iteration PBKDF2 derivations; the packing itself is covered
+    /// far more broadly by `test_random_secrets_always_roundtrip_through_words`.
+    #[test]
+    fn test_generated_seeds_always_roundtrip() {
+        for i in 0..4 {
+            let (words, key, birthday) = generate_polyseed();
+            let phrase = words.join(" ");
+            match polyseed_to_key(&phrase) {
+                Ok((decoded_key, decoded_birthday)) => {
+                    assert_eq!(decoded_key, key, "iteration {i}: key mismatch for {phrase}");
+                    assert_eq!(
+                        decoded_birthday, birthday,
+                        "iteration {i}: birthday mismatch for {phrase}"
+                    );
+                }
+                Err(e) => panic!("iteration {i}: generated polyseed rejected ({e}): {phrase}"),
+            }
+        }
     }
 
     #[test]
@@ -537,6 +703,247 @@ mod tests {
             find_bip39_index("aban").unwrap(),
             find_bip39_index("abandon").unwrap()
         );
+    }
+
+    /// BIP39's defining property for prefix matching: truncating each word to
+    /// its first 4 characters (or the whole word, when shorter) must be
+    /// injective. `find_bip39_index` accepts 4-char prefixes, so a collision
+    /// would silently resolve a typo to the wrong word — changing the seed.
+    #[test]
+    fn test_bip39_four_char_prefixes_are_unique() {
+        const BIP39_PREFIX_LEN: usize = 4;
+        let mut seen: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(BIP39_WORDLIST.len());
+        for (i, word) in BIP39_WORDLIST.iter().enumerate() {
+            let key = &word[..word.len().min(BIP39_PREFIX_LEN)];
+            if let Some(prev) = seen.insert(key, i) {
+                panic!(
+                    "'{}' and '{}' share the prefix '{}'",
+                    BIP39_WORDLIST[prev], word, key
+                );
+            }
+        }
+    }
+
+    /// Multiplication by 2 in GF(2^11) must be a permutation of the field.
+    ///
+    /// Doubling is invertible in any field of characteristic 2 (2 = x is a
+    /// non-zero element), so this must map 0..2048 onto itself bijectively. A
+    /// wrong reduction constant in `MUL2_TABLE` shows up immediately as a
+    /// collision or an out-of-range result, which would silently weaken the
+    /// checksum's error detection rather than break it outright.
+    #[test]
+    fn test_gf_elem_mul2_is_a_field_permutation() {
+        let mut seen = vec![false; 2048];
+        for x in 0u16..2048 {
+            let doubled = gf_elem_mul2(x);
+            assert!(
+                doubled < 2048,
+                "gf_elem_mul2({x}) = {doubled} escapes GF(2^11)"
+            );
+            assert!(
+                !seen[doubled as usize],
+                "gf_elem_mul2 is not injective at {x}"
+            );
+            seen[doubled as usize] = true;
+        }
+        assert_eq!(gf_elem_mul2(0), 0);
+        // The reduction only kicks in at the top half of the field.
+        assert_eq!(gf_elem_mul2(1023), 2046);
+        assert_eq!(gf_elem_mul2(1024), MUL2_TABLE[0]);
+    }
+
+    /// Secret and birthday extremes must survive the packing round trip.
+    ///
+    /// The secret's last byte carries only 6 of the 150 bits and the birthday
+    /// occupies exactly 10, so the all-zero and all-one patterns at both ends
+    /// are where an off-by-one in the bit shuffling surfaces.
+    #[test]
+    fn test_secret_and_birthday_edges_roundtrip() {
+        let mut all_ones = [0xffu8; SECRET_SIZE];
+        all_ones[SECRET_SIZE - 1] = 0x3f; // 150 bits, top 2 cleared
+
+        let mut low_bit = [0u8; SECRET_SIZE];
+        low_bit[0] = 0x01;
+        let mut high_bit = [0u8; SECRET_SIZE];
+        high_bit[SECRET_SIZE - 1] = 0x20; // most significant retained bit
+
+        let secrets = [
+            [0u8; SECRET_SIZE],
+            all_ones,
+            low_bit,
+            high_bit,
+            [0xaau8; SECRET_SIZE],
+            [0x55u8; SECRET_SIZE],
+        ];
+        let birthdays = [0u16, 1, 512, DATE_MASK as u16 - 1, DATE_MASK as u16];
+
+        for secret in secrets {
+            let mut secret = secret;
+            secret[SECRET_SIZE - 1] &= 0x3f;
+            for birthday in birthdays {
+                let data = PolyseedData {
+                    secret,
+                    features: 0,
+                    birthday,
+                };
+                let mut coeff = data_to_poly(&data);
+                coeff[0] = gf_poly_eval(&coeff);
+                assert_eq!(gf_poly_eval(&coeff), 0);
+                assert!(
+                    coeff.iter().all(|&c| (c as usize) < BIP39_WORDLIST.len()),
+                    "digit escapes the wordlist for birthday {birthday}"
+                );
+
+                let back = poly_to_data(&coeff);
+                assert_eq!(
+                    back.secret, secret,
+                    "secret mismatch at birthday {birthday}"
+                );
+                assert_eq!(back.birthday, birthday, "birthday mismatch");
+                assert_eq!(back.features, 0, "features mismatch");
+            }
+        }
+    }
+
+    /// Every non-zero feature set must be refused, not silently ignored.
+    ///
+    /// Feature bit 0 marks a passphrase-encrypted seed; decoding one as if it
+    /// were unencrypted would derive a wrong key and present an empty wallet
+    /// rather than an error. Only the 5 feature bits exist, so all 31 non-zero
+    /// combinations are enumerated.
+    #[test]
+    fn test_all_nonzero_feature_sets_rejected() {
+        for features in 1u8..(1 << FEATURE_BITS) {
+            let data = PolyseedData {
+                secret: [0x24u8; SECRET_SIZE],
+                features,
+                birthday: 42,
+            };
+            let mut coeff = data_to_poly(&data);
+            coeff[0] = gf_poly_eval(&coeff);
+            let phrase = coeff
+                .iter()
+                .map(|&i| BIP39_WORDLIST[i as usize])
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                polyseed_to_key(&phrase),
+                Err(PolyseedError::UnsupportedFeatures),
+                "feature set {features:#07b} must be rejected"
+            );
+        }
+    }
+
+    /// Malformed input must produce the matching error rather than a key.
+    #[test]
+    fn test_malformed_input_rejected() {
+        let (words, _, _) = generate_polyseed();
+
+        assert_eq!(polyseed_to_key(""), Err(PolyseedError::InvalidWordCount(0)));
+        assert_eq!(
+            polyseed_to_key(&words[..POLYSEED_WORDS - 1].join(" ")),
+            Err(PolyseedError::InvalidWordCount(POLYSEED_WORDS - 1))
+        );
+        let mut too_many = words.clone();
+        too_many.push("abandon".to_string());
+        assert_eq!(
+            polyseed_to_key(&too_many.join(" ")),
+            Err(PolyseedError::InvalidWordCount(POLYSEED_WORDS + 1))
+        );
+
+        let mut unknown = words.clone();
+        unknown[3] = "zzzzzzzz".to_string();
+        assert!(matches!(
+            polyseed_to_key(&unknown.join(" ")),
+            Err(PolyseedError::UnknownWord(_))
+        ));
+
+        // A word swapped for another valid word breaks the GF checksum.
+        let mut swapped = words.clone();
+        swapped[7] = if swapped[7] == "abandon" {
+            "ability".to_string()
+        } else {
+            "abandon".to_string()
+        };
+        assert_eq!(
+            polyseed_to_key(&swapped.join(" ")),
+            Err(PolyseedError::InvalidChecksum)
+        );
+
+        // Transposing two distinct words also breaks it (the checksum is
+        // position-dependent, not a sum).
+        let mut transposed = words.clone();
+        if transposed[2] != transposed[9] {
+            transposed.swap(2, 9);
+            assert_eq!(
+                polyseed_to_key(&transposed.join(" ")),
+                Err(PolyseedError::InvalidChecksum)
+            );
+        }
+    }
+
+    /// Capitalization, ragged whitespace and 4-char prefixes must all decode
+    /// to the same key.
+    #[test]
+    fn test_equivalent_input_forms_decode_identically() {
+        let (words, key, birthday) = generate_polyseed();
+        let canonical = words.join(" ");
+
+        for variant in [
+            canonical.to_uppercase(),
+            format!("  \t{}\n ", words.join("  \n\t ")),
+            words
+                .iter()
+                .map(|w| w.chars().take(4).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ] {
+            let (decoded_key, decoded_birthday) = polyseed_to_key(&variant)
+                .unwrap_or_else(|e| panic!("variant rejected ({e}): {variant}"));
+            assert_eq!(decoded_key, key, "key mismatch for {variant}");
+            assert_eq!(decoded_birthday, birthday, "birthday mismatch");
+        }
+    }
+
+    /// Prefix matching resolves any input sharing a word's first 4 characters
+    /// — including trailing garbage.
+    ///
+    /// Pinned because it is easy to mistake for a bug: "notabip39word" is
+    /// accepted as "notable". This mirrors upstream polyseed, which compares
+    /// words by their 4-character prefix rather than in full, and it is why
+    /// the GF checksum (not word validation) is what actually catches typos.
+    #[test]
+    fn test_prefix_matching_accepts_overlong_input() {
+        let notable = find_bip39_index("notable").unwrap();
+        assert_eq!(find_bip39_index("nota").unwrap(), notable);
+        assert_eq!(find_bip39_index("notabip39word").unwrap(), notable);
+        assert_eq!(find_bip39_index("NoTaBlE").unwrap(), notable);
+
+        // Input matching no word, or fewer than 4 characters of one, is not.
+        assert!(find_bip39_index("zzzzzzzz").is_err());
+        assert!(find_bip39_index("not").is_err());
+    }
+
+    /// The birthday clamp must saturate, not wrap.
+    ///
+    /// `birthday_encode` narrows to 10 bits; a clock set far enough ahead
+    /// (>= 2^32 time steps past the epoch) truncated to a small value instead
+    /// of saturating at `DATE_MASK` when the clamp was applied after the cast.
+    #[test]
+    fn test_birthday_encode_saturates_for_far_future_clocks() {
+        assert_eq!(birthday_encode(EPOCH + DATE_MASK as u64 * TIME_STEP), 1023);
+        assert_eq!(
+            birthday_encode(EPOCH + (DATE_MASK as u64 + 1) * TIME_STEP),
+            1023
+        );
+        // 2^32 time steps past the epoch: the value that used to wrap to 0.
+        assert_eq!(birthday_encode(EPOCH + (1u64 << 32) * TIME_STEP), 1023);
+        assert_eq!(birthday_encode(u64::MAX - 1), 1023);
+        // The explicit sentinel and any pre-epoch time stay at 0.
+        assert_eq!(birthday_encode(u64::MAX), 0);
+        assert_eq!(birthday_encode(0), 0);
+        assert_eq!(birthday_encode(EPOCH - 1), 0);
     }
 
     #[test]
