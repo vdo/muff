@@ -61,9 +61,10 @@ jobs:
           # Rust is extracted without a build; naming the mode explicitly is
           # what lets the autobuild step go away.
           build-mode: none
-          # security-extended adds lower-severity and precision-tuned queries
-          # beyond the default set.
-          queries: security-extended
+          # The query suite and the query-filters that trim it live together in
+          # the config file: filters only apply to queries declared alongside
+          # them, so naming a suite here instead would silently disable them.
+          config-file: .github/codeql/codeql-config.yml
 
       - name: Analyze
         uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6

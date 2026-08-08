@@ -1,0 +1,29 @@
+# CodeQL configuration for the workflow in ../workflows/codeql.yml.
+#
+# The query suite lives here rather than in the workflow's `queries:` input on
+# purpose: `query-filters` only apply to queries declared in this same config
+# file, so a suite named in the workflow would bypass the exclusion below.
+
+queries:
+  # security-extended adds lower-severity and precision-tuned queries beyond
+  # the default set.
+  - uses: security-extended
+
+query-filters:
+  # "Hard-coded cryptographic value" (CWE-259/321/798/1204).
+  #
+  # Every hit in this repository is a literal that has to be a literal:
+  # ed25519/Monero protocol constants such as the group order l
+  # (src/wallet/keys.rs), and the reference test vectors — seed phrases,
+  # expected KDF outputs, known key pairs — the wallet's crypto is checked
+  # against (src/wallet/polyseed.rs and friends). None of them protect real
+  # funds; actual key material is derived at runtime from the user's seed and
+  # an Argon2-derived wallet-file key.
+  #
+  # The query's taint tracking cannot tell a published test vector from a
+  # baked-in production key, so it reports the whole class and drowns out the
+  # Security tab. If we ever ship a genuine default key, salt, or IV, this
+  # exclusion would hide it — re-check this filter before adding any constant
+  # that guards real data.
+  - exclude:
+      id: rust/hard-coded-cryptographic-value
