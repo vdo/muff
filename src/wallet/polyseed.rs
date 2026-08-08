@@ -19,7 +19,9 @@
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-const BIP39_WORDLIST: &[&str] = &include!("words_bip39.rs");
+// Bare array expression, not a module - see the note on `WORDLIST` in
+// `mnemonic.rs` for why the file is not named `.rs`.
+const BIP39_WORDLIST: &[&str] = &include!("words_bip39.in");
 const POLYSEED_WORDS: usize = 16;
 const GF_BITS: u32 = 11;
 const SHARE_BITS: u32 = GF_BITS - 1; // secret bits per word

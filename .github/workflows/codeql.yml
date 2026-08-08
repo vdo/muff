@@ -43,18 +43,29 @@ jobs:
             pkg-config libssl-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
+      # The Rust extractor drives rust-analyzer, which needs sources on disk to
+      # expand macros. Without the standard library sources even `format!` and
+      # `println!` fail to expand, and without the crate sources every
+      # `tracing::info!` / `eyre!` call is a hole in the call graph. Both show
+      # up as a "Low Rust analysis quality" diagnostic and cost real coverage,
+      # so fetch them before the database is built.
+      - name: Prepare Rust sources for extraction
+        run: |
+          rustup component add rust-src
+          cargo fetch --locked
+
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         with:
           languages: rust
+          # Rust is extracted without a build; naming the mode explicitly is
+          # what lets the autobuild step go away.
+          build-mode: none
           # security-extended adds lower-severity and precision-tuned queries
           # beyond the default set.
           queries: security-extended
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
-
       - name: Analyze
-        uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         with:
           category: /language:rust

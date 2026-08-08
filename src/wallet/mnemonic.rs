@@ -5,7 +5,7 @@
 //! 3 words encodes 4 bytes of the 32-byte seed; the 25th word is a checksum:
 //! a repetition of one of the phrase's own 24 words, at position
 //! `crc32(3-char prefixes of the 24 words) % 24`. Because both the wordlist
-//! (`words_en.rs`, from `src/mnemonics/english.h`) and the checksum rule match
+//! (`words_en.in`, from `src/mnemonics/english.h`) and the checksum rule match
 //! upstream exactly, phrases generated here pass the Electrum wordlist check
 //! in the official GUI/CLI and vice versa.
 //!
@@ -14,7 +14,11 @@
 //! other console output.
 
 /// The 1626-word English wordlist for Monero mnemonics.
-const WORDLIST: &[&str] = &include!("words_en.rs");
+///
+/// The file is a bare array expression, not a module, so it carries a `.in`
+/// extension: a `.rs` name makes source indexers (rustfmt, CodeQL) try to
+/// parse it as a crate and emit thousands of bogus syntax errors.
+const WORDLIST: &[&str] = &include!("words_en.in");
 
 /// Number of words in a seed phrase without checksum.
 const SEED_LENGTH: usize = 24;
