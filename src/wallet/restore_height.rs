@@ -9,7 +9,8 @@
 //! Erring early is free — the scanner just checks some extra blocks — while
 //! erring late silently hides funds received before the start height. Every
 //! rounding decision here is therefore biased backwards, and the result is
-//! additionally rolled back by [`CLEARANCE_BLOCKS`].
+//! additionally rolled back by a fixed `CLEARANCE_BLOCKS` margin of five
+//! days' worth of blocks.
 
 use crate::config::NetworkKind;
 use std::sync::OnceLock;
