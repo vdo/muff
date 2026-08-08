@@ -64,7 +64,7 @@ qrcode = { version = "0.14", default-features = false }
 # Encrypted wallet database
 rusqlite = { version = "0.32", features = ["bundled", "serialize"] }
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 argon2 = "0.5"
 
 [dev-dependencies]
